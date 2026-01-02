@@ -1,0 +1,15 @@
+services:
+  fleetmate:
+    build: .
+    ports:
+      - "8501:8501"
+    environment:
+      # Optional: enable Gemini narrative + assistant
+      # GEMINI_API_KEY: "YOUR_KEY"
+      # GEMINI_MODEL: "gemini-2.5-flash-lite"
+      APP_FILE: "app_ui_wizard.py"
+    # For live-edit dev (recommended during UI work):
+    # volumes:
+    #   - ./:/app
+    env_file:
+      - .env

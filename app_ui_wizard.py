@@ -1033,8 +1033,13 @@ div[data-testid="stRadio"] label {
   color: rgba(245,247,255,0.92) !important;
 }
 
-.st-bc {
-color: #fff;
+.st-bc, .stBaseButton, .stBaseButton-secondary{
+color: #fff !important;
+}
+            
+.stAppHeader {
+background-color: transparent !important;
+color: #fff !important;
 }
             
 .st-emotion-cache-18kf3ut {
@@ -1544,7 +1549,7 @@ with left:
                         st.info("PDF export needs the Python package 'reportlab'. Add it to requirements.txt and rebuild Docker." if st.session_state["lang"] == "EN"
                                 else "PDF-Export braucht das Python-Paket 'reportlab'. Füge es zur requirements.txt hinzu und baue Docker neu.")
                     else:
-                        st.download_button(
+                        st.button(
                             "⬇️ Download PDF report" if st.session_state["lang"] == "EN" else "⬇️ PDF-Report downloaden",
                             data=pdf_bytes,
                             file_name="fleetmate_report.pdf",

@@ -973,7 +973,7 @@ div[data-baseweb="select"] > div{
   background: rgba(255,255,255,0.06) !important;
   border-color: rgba(255,255,255,0.16) !important;
 }
-div[data-baseweb="select"] *{ color: var(--txt) !important; }
+div[data-baseweb="select"] *{ color: #000 !important; }
 div[data-baseweb="select"] svg{ fill: var(--txt) !important; }
 
 div[data-baseweb="popover"] > div{
@@ -982,7 +982,7 @@ div[data-baseweb="popover"] > div{
   box-shadow: 0 24px 72px rgba(0,0,0,0.55) !important;
 }
 ul[role="listbox"]{ background: transparent !important; }
-li[role="option"]{ color: var(--txt) !important; }
+li[role="option"]{ color: #000 !important; }
 li[role="option"]:hover{ background: rgba(255,255,255,0.08) !important; }
 
 div[data-baseweb="slider"] *{ color: var(--txt) !important; }
@@ -1033,6 +1033,13 @@ div[data-testid="stRadio"] label {
   color: rgba(245,247,255,0.92) !important;
 }
 
+.st-bc {
+color: #fff;
+}
+            
+.st-emotion-cache-18kf3ut {
+margin-top: 15px;
+}
 </style>
 """, unsafe_allow_html=True)
 

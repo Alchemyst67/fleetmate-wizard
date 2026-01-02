@@ -36,7 +36,7 @@ def require_login():
             else:
                 st.error("Falsches Passwort.")
     with c2:
-        st.caption("Tipp: Passwort ist in Streamlit Secrets hinterlegt.")
+        st.caption("Tipp: Das Passwort ist die Partner-Firma klein geschrieben. (7 Buchstaben - Österreich)")
 
     st.stop()
 
@@ -444,7 +444,7 @@ TEXT = {
         "capacity_ok_yes": "Capacity OK",
         "capacity_ok_no": "Capacity exceeded",
         "constraints": "Constraints & recommendations",
-        "narrative": "Gemini narrative (customer-ready)",
+        "narrative": "Analysis & Recommendation",
         "gemini_missing": "_(Gemini not configured — add GEMINI_API_KEY to enable narrative.)_",
         "debug": "Debug: last Gemini payload",
         "apply_defaults": "Use recommended defaults",
@@ -472,7 +472,7 @@ TEXT = {
         "capacity_ok_yes": "Kapazität OK",
         "capacity_ok_no": "Kapazität überschritten",
         "constraints": "Constraints & Empfehlungen",
-        "narrative": "Gemini-Text (kundenfertig)",
+        "narrative": "Analyse & Empfehlung",
         "gemini_missing": "_(Gemini nicht konfiguriert — füge GEMINI_API_KEY hinzu.)_",
         "debug": "Debug: letztes Gemini-Payload",
         "apply_defaults": "Empfohlene Defaults übernehmen",
@@ -1549,7 +1549,7 @@ with left:
                         st.info("PDF export needs the Python package 'reportlab'. Add it to requirements.txt and rebuild Docker." if st.session_state["lang"] == "EN"
                                 else "PDF-Export braucht das Python-Paket 'reportlab'. Füge es zur requirements.txt hinzu und baue Docker neu.")
                     else:
-                        st.button(
+                        st.download_button(
                             "⬇️ Download PDF report" if st.session_state["lang"] == "EN" else "⬇️ PDF-Report downloaden",
                             data=pdf_bytes,
                             file_name="fleetmate_report.pdf",

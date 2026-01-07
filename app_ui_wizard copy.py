@@ -6,12 +6,6 @@ import streamlit as st
 import io
 import datetime
 import hmac
-import numpy as np
-import pandas as pd
-import matplotlib
-matplotlib.use("Agg")  # wichtig im Docker/Headless
-import matplotlib.pyplot as plt
-
 
 from recommendations import detect_issues, generate_solution_set
 
@@ -20,9 +14,9 @@ def require_login():
     try:
         expected = str(st.secrets.get("APP_PASSWORD", "")).strip()
     except Exception:
-        expected = ""
+        expected = "verbund"
     if not expected:
-        expected = ""  # optional: fallback via os.getenv("APP_PASSWORD")
+        expected = "verbund"  # optional: fallback via os.getenv("APP_PASSWORD")
 
     if "authed" not in st.session_state:
         st.session_state["authed"] = False
@@ -82,38 +76,19 @@ def effective_grid_co2_kg_per_kwh(shares):
     return g / 1000.0
 
 
-def effective_energy_price_details(avg_price_eur_per_mwh: float, dynamic_share: float, shares):
+def effective_energy_price_eur_per_mwh(avg_price_eur_per_mwh: float, dynamic_share: float, shares):
     avg_price_eur_per_kwh = max(0.0, float(avg_price_eur_per_mwh)) / 1000.0
     dynamic_share = min(max(float(dynamic_share), 0.0), 1.0)
 
-    curve_avg = float(sum(TOU_PRICE_EUR_PER_KWH)) / 24.0
-    window_avg = float(sum(p * s for p, s in zip(TOU_PRICE_EUR_PER_KWH, shares)))
+    curve_avg = sum(TOU_PRICE_EUR_PER_KWH) / 24.0
+    window_avg = sum(p * s for p, s in zip(TOU_PRICE_EUR_PER_KWH, shares))
     rel = (window_avg / curve_avg) if curve_avg > 0 else 1.0
 
     fixed_part = avg_price_eur_per_kwh * (1.0 - dynamic_share)
     dynamic_part = avg_price_eur_per_kwh * dynamic_share * rel
+
     eff_eur_per_kwh = fixed_part + dynamic_part
-
-    eff_eur_per_mwh = eff_eur_per_kwh * 1000.0
-    details = {
-        "avg_price_eur_per_kwh": avg_price_eur_per_kwh,
-        "tou_curve_avg_eur_per_kwh": curve_avg,
-        "tou_window_avg_eur_per_kwh": window_avg,
-        "tou_rel_factor": rel,
-        "dynamic_share": dynamic_share,
-        "effective_price_eur_per_mwh": eff_eur_per_mwh,
-    }
-    return eff_eur_per_mwh, details
-
-
-def effective_grid_co2_details(shares):
-    day_avg_g = float(sum(GRID_CO2_G_PER_KWH)) / 24.0
-    window_avg_g = float(sum(c * s for c, s in zip(GRID_CO2_G_PER_KWH, shares)))
-    return (window_avg_g / 1000.0), {
-        "grid_day_avg_g_per_kwh": day_avg_g,
-        "grid_window_avg_g_per_kwh": window_avg_g,
-        "grid_window_avg_kg_per_kwh": window_avg_g / 1000.0,
-    }
+    return eff_eur_per_kwh * 1000.0  # €/MWh
 
 
 def run_model(
@@ -164,14 +139,14 @@ def run_model(
     total_daily_energy_mwh = num_trucks * events_per_truck_per_day * energy_per_event_mwh
     annual_energy_mwh = total_daily_energy_mwh * operating_days
 
-    eff_price_eur_per_mwh, price_details = effective_energy_price_details(
+    eff_price_eur_per_mwh = effective_energy_price_eur_per_mwh(
         avg_elec_price_eur_per_mwh, dynamic_price_share, shares
     )
 
     annual_cost_eur = annual_energy_mwh * eff_price_eur_per_mwh
 
     # CO2
-    eff_grid_co2_kg_per_kwh, co2_details = effective_grid_co2_details(shares)
+    eff_grid_co2_kg_per_kwh = effective_grid_co2_kg_per_kwh(shares)
     annual_energy_kwh = annual_energy_mwh * 1000.0
     annual_ev_co2_kg = annual_energy_kwh * eff_grid_co2_kg_per_kwh
 
@@ -238,7 +213,7 @@ def run_model(
             "peak_duration_h": peak_duration_h,
         },
         "charging_profile": {
-            "flags": flags,
+            "flags": compute_flags_and_shares(start_h, end_h)[0],
             "shares": shares,
             "grid_co2_g_per_kwh": GRID_CO2_G_PER_KWH,
             "tou_price_eur_per_kwh": TOU_PRICE_EUR_PER_KWH,
@@ -339,7 +314,6 @@ def ensure_defaults():
     st.session_state.setdefault("report_pdf_bytes", None)
     st.session_state.setdefault("assistant_messages", [])
     st.session_state.setdefault("last_gemini_payload", None)
-    st.session_state.setdefault("charts_md", None)
 
 
 def get_inp(k: str):
@@ -407,12 +381,13 @@ def bind_select(step_id: str, field: str, label: str, options, format_func=None,
     def _sync():
         set_inp(field, st.session_state[k])
 
+    # IMPORTANT: Streamlit calls format_func(option). Passing None causes:
+    # TypeError: 'NoneType' object is not callable
     select_kwargs = dict(options=options, key=k, on_change=_sync, **kwargs)
     if callable(format_func):
         select_kwargs["format_func"] = format_func
 
     st.selectbox(label, **select_kwargs)
-
 
 
 def recalc_from_inputs():
@@ -709,115 +684,6 @@ def call_gemini_report(results: dict, issues: list, solutions: list) -> str:
         text = ""
     return text or ""
 
-def explain_charts_deterministic(res: dict, dfh: pd.DataFrame, lang: str) -> str:
-    ec = res["energy_cost"]
-    dv = res["diesel_vs_ev"]
-    co2 = res["co2"]
-    load = res["load"]
-    inp = res["inputs"]
-
-    # Key numbers
-    annual_energy_mwh = float(ec.get("annual_energy_mwh", 0.0))
-    eff_price = float(ec.get("effective_price_eur_per_mwh", 0.0))
-    ev_cost = float(ec.get("annual_cost_eur", 0.0))
-    diesel_cost = float(dv.get("diesel_cost_baseline_eur", 0.0))
-    total_savings = float(dv.get("total_savings_incl_toll_eur", 0.0))
-    ev_co2 = float(co2.get("annual_ev_co2_kg", 0.0))
-    co2_savings = float(dv.get("co2_savings_kg", 0.0))
-    peak_kw = float(load.get("new_theoretical_peak_kw", 0.0))
-    cap_kva = float(inp.get("site_capacity_limit_kva", 0.0))
-    start_h = int(inp.get("start_hour", 0))
-    end_h = int(inp.get("end_hour", 0))
-    win_h = int(sum(res["charging_profile"]["flags"])) if "charging_profile" in res else None
-
-    # Simple “best hours” hints from df (price & co2)
-    df = dfh.copy()
-    df["score_price"] = df["tou_eur_per_kwh"]
-    df["score_co2"] = df["grid_co2_g_per_kwh"]
-    cheap_hour = int(df.loc[df["score_price"].idxmin(), "hour"])
-    green_hour = int(df.loc[df["score_co2"].idxmin(), "hour"])
-
-    if lang == "EN":
-        return (
-            "#### What the charts show\n"
-            f"- **TOU price & grid CO₂:** Cheapest hour ≠ greenest hour. In your data, cheapest is around **{cheap_hour:02d}:00**, greenest around **{green_hour:02d}:00**.\n"
-            f"- **Load profile:** Dashed line is the site limit. Your theoretical peak is **{peak_kw:,.0f} kW**"
-            + (f" vs limit **{cap_kva:,.0f} kVA**." if cap_kva > 0 else ".") + "\n"
-            "- **Waterfall:** Diesel cost → EV electricity cost → toll effect → net result.\n"
-            "- **Pareto (shift window):** Each label is a start-hour; further left = cheaper, lower = less CO₂.\n\n"
-            "#### Key figures behind the plots\n"
-            f"- Annual energy: **{annual_energy_mwh:,.0f} MWh/year** at **{eff_price:,.0f} €/MWh**\n"
-            f"- EV electricity cost: **{ev_cost:,.0f} €/year** vs diesel baseline **{diesel_cost:,.0f} €/year**\n"
-            f"- Total savings (incl. toll): **{total_savings:,.0f} €/year**\n"
-            f"- CO₂: EV **{ev_co2:,.0f} kg/year**, savings **{co2_savings:,.0f} kg/year**\n"
-        )
-
-    # DE
-    return (
-        "#### Was die Charts zeigen\n"
-        f"- **TOU-Preis & Netz-CO₂:** Günstigste Stunde ≠ „grünste“ Stunde. In deinen Daten: günstigste Stunde ca. **{cheap_hour:02d}:00**, niedrigstes CO₂ ca. **{green_hour:02d}:00**.\n"
-        f"- **Lastprofil:** Gestrichelt = Anschlusslimit. Dein theoretischer Peak liegt bei **{peak_kw:,.0f} kW**"
-        + (f" vs Limit **{cap_kva:,.0f} kVA**." if cap_kva > 0 else ".") + "\n"
-        "- **Waterfall:** Diesel-Kosten → EV-Stromkosten → Maut-Effekt → Netto.\n"
-        "- **Pareto (Fenster verschoben):** Jede Markierung ist eine Startstunde; weiter links = günstiger, weiter unten = weniger CO₂.\n\n"
-        "#### Wichtigste Zahlen hinter den Plots\n"
-        f"- Jahresenergie: **{annual_energy_mwh:,.0f} MWh/Jahr** bei **{eff_price:,.0f} €/MWh**\n"
-        f"- EV-Stromkosten: **{ev_cost:,.0f} €/Jahr** vs Diesel-Baseline **{diesel_cost:,.0f} €/Jahr**\n"
-        f"- Gesamteinsparung (inkl. Maut): **{total_savings:,.0f} €/Jahr**\n"
-        f"- CO₂: EV **{ev_co2:,.0f} kg/Jahr**, Ersparnis **{co2_savings:,.0f} kg/Jahr**\n"
-    )
-
-def call_gemini_charts(res: dict, dfh: pd.DataFrame) -> str:
-    api_key = _gemini_key()
-    if not api_key:
-        return ""
-
-    model = _gemini_model()
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-    params = {"key": api_key}
-
-    lang = st.session_state.get("lang", DEFAULT_LANG)
-    lang_instruction = "Write in German." if lang == "DE" else "Write in English."
-
-    compact = _compact_for_llm(res)
-
-    # very compact chart context (no heavy tables)
-    chart_ctx = {
-        "tou_min_hour": int(dfh.loc[dfh["tou_eur_per_kwh"].idxmin(), "hour"]),
-        "tou_max_hour": int(dfh.loc[dfh["tou_eur_per_kwh"].idxmax(), "hour"]),
-        "co2_min_hour": int(dfh.loc[dfh["grid_co2_g_per_kwh"].idxmin(), "hour"]),
-        "co2_max_hour": int(dfh.loc[dfh["grid_co2_g_per_kwh"].idxmax(), "hour"]),
-    }
-
-    prompt = (
-        "You are Eva. Explain the charts to a customer.\n"
-        f"{lang_instruction}\n"
-        "Be clear, honest, no fluff. Use bullets.\n"
-        "Max 10 bullets + 1 short paragraph.\n"
-        "Mention what the user should do next if capacity is exceeded.\n\n"
-        "MODEL RESULTS (compact):\n"
-        f"{json.dumps(compact, ensure_ascii=False)}\n\n"
-        "CHART CONTEXT:\n"
-        f"{json.dumps(chart_ctx, ensure_ascii=False)}\n"
-    )
-
-    payload = {
-        "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"temperature": 0.2, "maxOutputTokens": 450},
-    }
-
-    try:
-        resp = requests.post(url, params=params, json=payload, timeout=25)
-        if resp.status_code >= 300:
-            return ""
-        data = resp.json()
-        cands = data.get("candidates", [])
-        parts = cands[0].get("content", {}).get("parts", []) if cands else []
-        text = "\n".join([p.get("text", "") for p in parts if isinstance(p, dict) and p.get("text")]).strip()
-        return text or ""
-    except Exception:
-        return ""
-
 
 # =========================================================
 # UI helpers
@@ -860,7 +726,7 @@ def _md_to_text(md: str) -> str:
     return txt.strip()
 
 
-def build_report_pdf_bytes(title: str, kpis: dict, narrative_md: str, issues: list, solutions: list, lang: str, charts: list = None) -> bytes:
+def build_report_pdf_bytes(title: str, kpis: dict, narrative_md: str, issues: list, solutions: list, lang: str) -> bytes:
     """
     Build a clean PDF using reportlab (no HTML renderer needed).
     Returns b"" if reportlab is missing.
@@ -871,9 +737,6 @@ def build_report_pdf_bytes(title: str, kpis: dict, narrative_md: str, issues: li
         from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
         from reportlab.lib.units import cm
         from reportlab.lib import colors
-        from reportlab.platypus import Image as RLImage, PageBreak
-        from reportlab.lib.utils import ImageReader
-
     except Exception:
         return b""
 
@@ -944,24 +807,6 @@ def build_report_pdf_bytes(title: str, kpis: dict, narrative_md: str, issues: li
         for i, s in enumerate(solutions, 1):
             story.append(Paragraph(f"{i}. <b>{s.get('title','')}</b> — {s.get('definition','')}", body))
 
-    # Charts (optional)
-    if charts:
-        story.append(PageBreak())
-        story.append(Paragraph("Charts", h2))
-        for title_c, png in charts:
-            story.append(Paragraph(str(title_c), body))
-            try:
-                img_reader = ImageReader(io.BytesIO(png))
-                iw, ih = img_reader.getSize()
-                max_w = 16.5 * cm
-                scale = max_w / float(iw)
-                w = max_w
-                h = float(ih) * scale
-                story.append(RLImage(io.BytesIO(png), width=w, height=h))
-                story.append(Spacer(1, 10))
-            except Exception:
-                story.append(Paragraph("Chart rendering failed.", body))
-
     doc.build(story)
     return buf.getvalue()
 
@@ -1020,188 +865,6 @@ def handle_user_chat(msg: str, current_step_name: str):
         recalc_from_inputs()
         ack = "✅ Updated inputs and recalculated." if st.session_state.get("lang") == "EN" else "✅ Inputs aktualisiert und neu berechnet."
         st.session_state["assistant_messages"].append({"role": "assistant", "content": ack})
-
-def build_calculation_df(res: dict) -> pd.DataFrame:
-    inp = res["inputs"]
-    ec = res["energy_cost"]
-    dv = res["diesel_vs_ev"]
-    co2 = res["co2"]
-    dist = res["distance"]
-    load = res["load"]
-
-    soc_diff = ec.get("soc_diff", 0.0)
-    energy_event_mwh = (ec.get("total_daily_energy_mwh", 0.0) / max(inp["num_trucks"] * inp["events_per_truck_per_day"], 1e-9))
-    energy_event_kwh = energy_event_mwh * 1000.0
-
-    annual_km = dist.get("annual_km_fleet", 0.0)
-    annual_energy_mwh = ec.get("annual_energy_mwh", 0.0)
-    annual_cost = ec.get("annual_cost_eur", 0.0)
-
-    cost_per_km = (annual_cost / annual_km) if annual_km > 0 else np.nan
-    ev_co2_per_km = (co2.get("annual_ev_co2_kg", 0.0) / annual_km) if annual_km > 0 else np.nan
-    diesel_co2_per_km = (dv.get("diesel_co2_baseline_kg", 0.0) / annual_km) if annual_km > 0 else np.nan
-
-    rows = [
-        ("SoC diff", "max(0, target_soc - start_soc)", soc_diff, "—"),
-        ("Energy per event", "battery_kwh * soc_diff", energy_event_kwh, "kWh"),
-        ("Daily energy", "num_trucks * events/day * energy/event", ec.get("total_daily_energy_mwh", 0.0) * 1000.0, "kWh/day"),
-        ("Annual energy", "daily_energy * operating_days", annual_energy_mwh, "MWh/year"),
-        ("Effective electricity price", "avg_price adjusted by TOU (dynamic_share)", ec.get("effective_price_eur_per_mwh", 0.0), "€/MWh"),
-        ("EV electricity cost", "annual_energy_mwh * effective_price", annual_cost, "€/year"),
-        ("Diesel litres baseline", "annual_km * L/100km / 100", dv.get("diesel_cost_baseline_eur", 0.0) / max(inp["diesel_price_eur_per_l"], 1e-9), "L/year"),
-        ("Diesel cost baseline", "diesel_litres * diesel_price", dv.get("diesel_cost_baseline_eur", 0.0), "€/year"),
-        ("Baseline toll cost", "annual_km * tolled_share * toll_rate", dv.get("baseline_toll_cost_eur", 0.0), "€/year"),
-        ("Total savings incl. toll", "diesel_cost - ev_cost + toll_savings", dv.get("total_savings_incl_toll_eur", 0.0), "€/year"),
-        ("EV CO₂", "annual_kWh * grid_CO2_window", co2.get("annual_ev_co2_kg", 0.0), "kg/year"),
-        ("Diesel CO₂ baseline", "diesel_litres * 2.64", dv.get("diesel_co2_baseline_kg", 0.0), "kg/year"),
-        ("CO₂ savings", "diesel_CO2 - ev_CO2", dv.get("co2_savings_kg", 0.0), "kg/year"),
-        ("Theoretical peak (new)", "existing_peak + (num_trucks * charger_kw)", load.get("new_theoretical_peak_kw", 0.0), "kW"),
-        ("Avg load (new)", "existing_peak + (daily_energy_kWh / charging_window_h)", load.get("new_avg_load_kw", 0.0), "kW"),
-        ("Cost per km (EV)", "annual_ev_cost / annual_km", cost_per_km, "€/km"),
-        ("CO₂ per km (EV)", "annual_ev_co2 / annual_km", ev_co2_per_km, "kg/km"),
-        ("CO₂ per km (diesel)", "diesel_co2 / annual_km", diesel_co2_per_km, "kg/km"),
-    ]
-    df = pd.DataFrame(rows, columns=["Metric", "Formula", "Value", "Unit"])
-    return df
-
-
-def build_hourly_df(res: dict) -> pd.DataFrame:
-    inp = res["inputs"]
-    prof = res["charging_profile"]
-    ec = res["energy_cost"]
-
-    flags = prof["flags"]
-    shares = prof["shares"]
-
-    total_daily_kwh = float(ec["total_daily_energy_mwh"]) * 1000.0
-    clock_hours = int(sum(flags)) if sum(flags) > 0 else 24
-    power_if_spread_kw = (total_daily_kwh / clock_hours) if clock_hours > 0 else 0.0
-
-    # effektive Ladeleistung (aus charging_window_hours)
-    eff_power_kw = (total_daily_kwh / float(inp["charging_window_hours"])) if inp["charging_window_hours"] > 0 else 0.0
-
-    ev_kw = [power_if_spread_kw if flags[h] else 0.0 for h in range(24)]
-    ev_kwh = [ev_kw[h] for h in range(24)]  # 1h bins
-    site_load_kw = [float(inp["existing_site_peak_kw"]) + ev_kw[h] for h in range(24)]
-
-    df = pd.DataFrame({
-        "hour": list(range(24)),
-        "in_window": [bool(f) for f in flags],
-        "share": shares,
-        "tou_eur_per_kwh": prof["tou_price_eur_per_kwh"],
-        "grid_co2_g_per_kwh": prof["grid_co2_g_per_kwh"],
-        "ev_power_kw_spread": ev_kw,
-        "ev_energy_kwh": ev_kwh,
-        "site_load_kw_spread": site_load_kw,
-        "eff_power_kw_required": [eff_power_kw] * 24,
-    })
-    return df
-
-
-def fig_price_co2(df: pd.DataFrame):
-    fig, ax1 = plt.subplots(figsize=(10, 4))
-    ax2 = ax1.twinx()
-
-    ax1.plot(df["hour"], df["tou_eur_per_kwh"], marker="o")
-    ax2.plot(df["hour"], df["grid_co2_g_per_kwh"], marker="s")
-
-    ax1.set_xlabel("Hour")
-    ax1.set_ylabel("TOU price (€/kWh)")
-    ax2.set_ylabel("Grid CO₂ (g/kWh)")
-
-    # Window shading
-    inw = df["in_window"].to_numpy()
-    if inw.any():
-        # contiguous blocks
-        hours = df["hour"].to_numpy()
-        for h in range(24):
-            if inw[h]:
-                ax1.axvspan(h - 0.5, h + 0.5, alpha=0.08)
-
-    ax1.set_xticks(range(0, 24, 1))
-    ax1.grid(True, alpha=0.2)
-    fig.tight_layout()
-    return fig
-
-
-def fig_load(df: pd.DataFrame, capacity_kva: float, theoretical_peak_kw: float):
-    fig, ax = plt.subplots(figsize=(10, 4))
-    ax.plot(df["hour"], df["site_load_kw_spread"], marker="o", label="Site load (spread across window)")
-    ax.plot(df["hour"], df["eff_power_kw_required"] + df["site_load_kw_spread"]*0 + 0, alpha=0.0)  # keep axes stable
-
-    if capacity_kva and capacity_kva > 0:
-        ax.axhline(capacity_kva, linestyle="--", label="Site capacity limit (kVA≈kW)")
-    ax.axhline(theoretical_peak_kw, linestyle=":", label="Theoretical peak (all chargers @ max)")
-
-    ax.set_xlabel("Hour")
-    ax.set_ylabel("kW")
-    ax.grid(True, alpha=0.2)
-    ax.legend(loc="best")
-    fig.tight_layout()
-    return fig
-
-
-def fig_waterfall(res: dict):
-    dv = res["diesel_vs_ev"]
-    diesel = float(dv["diesel_cost_baseline_eur"])
-    ev = float(dv["ev_cost_eur"])
-    toll = float(dv["toll_savings_eur"])
-    total = float(dv["total_savings_incl_toll_eur"])
-
-    labels = ["Diesel cost", "EV electricity cost", "Toll savings", "Total savings"]
-    vals = [diesel, -ev, toll, total]
-
-    fig, ax = plt.subplots(figsize=(10, 4))
-    cum = 0.0
-    xs = np.arange(len(labels))
-    for i, v in enumerate(vals[:-1]):
-        ax.bar(xs[i], v, bottom=cum)
-        cum += v
-    ax.bar(xs[-1], vals[-1])
-
-    ax.set_xticks(xs)
-    ax.set_xticklabels(labels, rotation=15, ha="right")
-    ax.set_ylabel("€/year")
-    ax.grid(True, axis="y", alpha=0.2)
-    fig.tight_layout()
-    return fig
-
-
-def fig_pareto_shifted_windows(res: dict):
-    """Trade-off: shift the same window length across the day, plot EV cost vs EV CO2."""
-    base_inp = res["inputs"].copy()
-    flags, _ = compute_flags_and_shares(base_inp["start_hour"], base_inp["end_hour"])
-    win_len = int(sum(flags)) if sum(flags) > 0 else 24
-
-    points = []
-    for start in range(24):
-        end = (start + win_len) % 24
-        r = run_model(**{**base_inp, "start_hour": start, "end_hour": end})
-        points.append({
-            "start": start, "end": end,
-            "cost": float(r["energy_cost"]["annual_cost_eur"]),
-            "co2": float(r["co2"]["annual_ev_co2_kg"]),
-        })
-
-    df = pd.DataFrame(points)
-    fig, ax = plt.subplots(figsize=(8, 5))
-    ax.scatter(df["cost"], df["co2"])
-    for _, row in df.iterrows():
-        ax.annotate(f'{int(row["start"]):02d}', (row["cost"], row["co2"]), fontsize=8)
-
-    ax.set_xlabel("EV cost (€/year)")
-    ax.set_ylabel("EV CO₂ (kg/year)")
-    ax.grid(True, alpha=0.2)
-    fig.tight_layout()
-    return fig
-
-
-def fig_to_png_bytes(fig) -> bytes:
-    buf = io.BytesIO()
-    fig.savefig(buf, format="png", dpi=160, bbox_inches="tight")
-    plt.close(fig)
-    return buf.getvalue()
-
 
 
 # =========================================================
@@ -1382,22 +1045,6 @@ color: #fff !important;
 .st-emotion-cache-18kf3ut {
 margin-top: 15px;
 }
-            
-.stDownloadButton > button{
-  border-radius: 999px !important;
-  padding: 0.62rem 1.0rem !important;
-  border: 1px solid rgba(255,255,255,0.18) !important;
-  color: var(--txt) !important;
-  background: linear-gradient(180deg, var(--glass), var(--glass2)) !important;
-  box-shadow: var(--shadow2) !important;
-  backdrop-filter: blur(12px) !important;
-}
-.stDownloadButton > button:hover{
-  transform: translateY(-1px);
-  box-shadow: 0 22px 58px rgba(0,0,0,0.45) !important;
-}
-.stDownloadButton > button:active{transform: translateY(0px);}
-
 </style>
 """, unsafe_allow_html=True)
 
@@ -1441,8 +1088,6 @@ apply_pending_flow()
 ensure_assistant_greeting()
 recalc_from_inputs()
 
-
-
 top_l, top_r = st.columns([0.70, 0.30], vertical_alignment="center")
 with top_l:
     st.markdown(f"<h1 class='gs-title'>{t('welcome_title')}</h1>", unsafe_allow_html=True)
@@ -1460,12 +1105,10 @@ with top_r:
     )
     if lang != current:
         st.session_state["lang"] = lang
-        st.session_state["charts_md"] = None
         st.session_state["report_md"] = None
         st.session_state["report_meta"] = None
         st.session_state["report_pdf_bytes"] = None
         st.rerun()
-        st.session_state["charts_md"] = None
 
 left, right = st.columns([0.62, 0.38], gap="large")
 
@@ -1621,8 +1264,8 @@ with left:
                     if st.button("✨ " + t("apply_defaults"), use_container_width=True, key="apply_profile_defaults"):
                         set_inp("battery_kwh", prof["battery_kwh"])
                         set_inp("ev_consumption", prof["ev_consumption"])
-                        st.session_state.pop(wkey("battery", "battery_kwh"), None)
-                        st.session_state.pop(wkey("battery", "ev_consumption"), None)
+                        st.session_state[wkey("battery", "battery_kwh")] = get_inp("battery_kwh")
+                        st.session_state[wkey("battery", "ev_consumption")] = get_inp("ev_consumption")
                         st.rerun()
                 with c_note:
                     st.markdown(
@@ -1717,7 +1360,7 @@ with left:
                 with cW2:
                     if st.button(t("apply_window"), use_container_width=True, key="apply_full_window"):
                         set_inp("charging_window_hours", float(wh))
-                        st.session_state.pop(wkey("electricity", "charging_window_hours"), None)  # wichtig!
+                        st.session_state[wkey("electricity", "charging_window_hours")] = float(wh)
                         st.rerun()
 
             elif sid == "site":
@@ -1828,292 +1471,89 @@ with left:
         if not res:
             st.info("—")
         else:
-            tabs = st.tabs([
-                "Overview" if st.session_state["lang"] == "EN" else "Übersicht",
-                "Charts",
-                "Calculations" if st.session_state["lang"] == "EN" else "Berechnungen",
-                "What-if" if st.session_state["lang"] == "EN" else "Sensitivität",
-                "Export"
-            ])
+            issues = detect_issues(res)
+            solutions = generate_solution_set(res, issues)
 
-            with tabs[0]:
-                issues = detect_issues(res)
-                solutions = generate_solution_set(res, issues)
+            ec = res["energy_cost"]
+            dv = res["diesel_vs_ev"]
+            load = res["load"]
 
-                ec = res["energy_cost"]
-                dv = res["diesel_vs_ev"]
-                load = res["load"]
+            a, b, c = st.columns(3)
+            with a: st.metric(t("kpi_savings"), fmt_eur(dv.get("total_savings_incl_toll_eur")))
+            with b: st.metric("EV cost / year" if st.session_state["lang"] == "EN" else "EV-Kosten / Jahr", fmt_eur(ec.get("annual_cost_eur")))
+            with c: st.metric(t("kpi_peak"), f"{fmt_num(load.get('new_theoretical_peak_kw'))} kW")
 
-                a, b, c = st.columns(3)
-                with a: st.metric(t("kpi_savings"), fmt_eur(dv.get("total_savings_incl_toll_eur")))
-                with b: st.metric("EV cost / year" if st.session_state["lang"] == "EN" else "EV-Kosten / Jahr", fmt_eur(ec.get("annual_cost_eur")))
-                with c: st.metric(t("kpi_peak"), f"{fmt_num(load.get('new_theoretical_peak_kw'))} kW")
-                # --- Additional KPIs (from calculations) ---
-                dist = res["distance"]
-                co2 = res["co2"]
+            gs_hr()
 
-                annual_km = float(dist.get("annual_km_fleet", 0.0))
-                ev_cost = float(ec.get("annual_cost_eur", 0.0))
-                ev_co2 = float(co2.get("annual_ev_co2_kg", 0.0))
-                diesel_co2 = float(dv.get("diesel_co2_baseline_kg", 0.0))
-                avg_load = float(load.get("new_avg_load_kw", 0.0))
-                shave_kw = float(load.get("required_shaving_kw", 0.0))
-                shave_kwh = float(load.get("required_battery_energy_kwh", 0.0))
+            with st.container(border=True):
+                st.markdown("### " + t("narrative"))
+                if st.session_state.get("report_md") is None:
+                    md = call_gemini_report(res, issues, solutions)
+                    st.session_state["report_md"] = md if md else t("gemini_missing")
+                    st.session_state["report_pdf_bytes"] = None
+                    st.session_state["report_meta"] = {"generated_at": __import__("datetime").datetime.utcnow().isoformat() + "Z"}
+                st.markdown(st.session_state["report_md"])
 
-                cost_per_km = (ev_cost / annual_km) if annual_km > 0 else None
-                ev_co2_per_km = (ev_co2 / annual_km) if annual_km > 0 else None
-                diesel_co2_per_km = (diesel_co2 / annual_km) if annual_km > 0 else None
+            gs_hr()
 
-                k1, k2, k3, k4 = st.columns(4)
-                with k1:
-                    st.metric("Jahresenergie" if st.session_state["lang"] == "DE" else "Annual energy",
-                            f"{float(ec.get('annual_energy_mwh',0.0)):,.0f} MWh")
-                with k2:
-                    st.metric("Effektiver Strompreis" if st.session_state["lang"] == "DE" else "Effective electricity price",
-                            f"{float(ec.get('effective_price_eur_per_mwh',0.0)):,.0f} €/MWh")
-                with k3:
-                    st.metric("Kosten pro km (EV)" if st.session_state["lang"] == "DE" else "Cost per km (EV)",
-                            (f"{cost_per_km:.2f} €/km" if cost_per_km is not None else "—"))
-                with k4:
-                    st.metric("Ø Last neu" if st.session_state["lang"] == "DE" else "New avg load",
-                            f"{avg_load:,.0f} kW")
+            with st.container(border=True):
+                st.markdown("### " + t("constraints"))
+                if not issues:
+                    st.success("No major constraints detected." if st.session_state["lang"] == "EN" else "Keine großen Constraints erkannt.")
+                else:
+                    for it in issues:
+                        sev = it.get("severity", "low")
+                        msg = it.get("description", "")
+                        if sev == "high":
+                            st.error(msg)
+                        elif sev == "medium":
+                            st.warning(msg)
+                        else:
+                            st.info(msg)
 
-                k5, k6, k7, k8 = st.columns(4)
-                with k5:
-                    st.metric("CO₂ pro km (EV)" if st.session_state["lang"] == "DE" else "CO₂ per km (EV)",
-                            (f"{ev_co2_per_km:.3f} kg/km" if ev_co2_per_km is not None else "—"))
-                with k6:
-                    st.metric("CO₂ pro km (Diesel)" if st.session_state["lang"] == "DE" else "CO₂ per km (diesel)",
-                            (f"{diesel_co2_per_km:.3f} kg/km" if diesel_co2_per_km is not None else "—"))
-                with k7:
-                    st.metric("Peak-Shaving nötig" if st.session_state["lang"] == "DE" else "Peak shaving needed",
-                            (f"{shave_kw:,.0f} kW" if shave_kw > 0 else "—"))
-                with k8:
-                    st.metric("Batterie-Energie dafür" if st.session_state["lang"] == "DE" else "Battery energy for shaving",
-                            (f"{shave_kwh:,.0f} kWh" if shave_kwh > 0 else "—"))
+                st.markdown("#### " + ("Best next actions" if st.session_state["lang"] == "EN" else "Nächste sinnvolle Schritte"))
+                for idx, s in enumerate(solutions, 1):
+                    st.markdown(f"**{idx}. {s.get('title','')}** — {s.get('definition','')}")
 
+            gs_hr()
 
-                gs_hr()
+            
+            with st.container(border=True):
+                st.markdown("### " + ("Download" if st.session_state["lang"] == "EN" else "Download"))
+                cA, cB = st.columns(2)
+                with cA:
+                    if st.button("↺ " + t("restart"), use_container_width=True, key="restart_btn_report"):
+                        reset_all()
+                        st.rerun()
+                with cB:
+                    # (Re)build PDF if needed
+                    if st.session_state.get("report_pdf_bytes") is None:
+                        kpis = {
+                            f"{t('kpi_savings')} ({t('per_year')})": fmt_eur(dv.get("total_savings_incl_toll_eur")),
+                            f"{t('kpi_co2')} ({t('per_year')})": fmt_kg(dv.get("co2_savings_kg")),
+                            t("kpi_peak"): f"{fmt_num(load.get('new_theoretical_peak_kw'))} kW",
+                            ("EV cost / year" if st.session_state["lang"] == "EN" else "EV-Kosten / Jahr"): fmt_eur(ec.get("annual_cost_eur")),
+                        }
+                        title = "FleetMate — Report"
+                        st.session_state["report_pdf_bytes"] = build_report_pdf_bytes(
+                            title=title,
+                            kpis=kpis,
+                            narrative_md=st.session_state.get("report_md") or "",
+                            issues=issues,
+                            solutions=solutions,
+                            lang=st.session_state.get("lang", "EN"),
+                        )
 
-                with st.container(border=True):
-                    st.markdown("### " + t("narrative"))
-                    if st.session_state.get("report_md") is None:
-                        md = call_gemini_report(res, issues, solutions)
-                        st.session_state["report_md"] = md if md else t("gemini_missing")
-                        st.session_state["report_pdf_bytes"] = None
-                        st.session_state["report_meta"] = {"generated_at": __import__("datetime").datetime.utcnow().isoformat() + "Z"}
-                    st.markdown(st.session_state["report_md"])
-
-                gs_hr()
-
-                with st.container(border=True):
-                    st.markdown("### " + t("constraints"))
-                    if not issues:
-                        st.success("No major constraints detected." if st.session_state["lang"] == "EN" else "Keine großen Constraints erkannt.")
+                    pdf_bytes = st.session_state.get("report_pdf_bytes") or b""
+                    if not pdf_bytes:
+                        st.info("PDF export needs the Python package 'reportlab'. Add it to requirements.txt and rebuild Docker." if st.session_state["lang"] == "EN"
+                                else "PDF-Export braucht das Python-Paket 'reportlab'. Füge es zur requirements.txt hinzu und baue Docker neu.")
                     else:
-                        for it in issues:
-                            sev = it.get("severity", "low")
-                            msg = it.get("description", "")
-                            if sev == "high":
-                                st.error(msg)
-                            elif sev == "medium":
-                                st.warning(msg)
-                            else:
-                                st.info(msg)
-
-                    st.markdown("#### " + ("Best next actions" if st.session_state["lang"] == "EN" else "Nächste sinnvolle Schritte"))
-                    for idx, s in enumerate(solutions, 1):
-                        st.markdown(f"**{idx}. {s.get('title','')}** — {s.get('definition','')}")
-
-            with tabs[1]:
-                dfh = build_hourly_df(res)
-
-                gs_hr()
-
-                # --- Chart 1 ---
-                f1 = fig_price_co2(dfh)
-                st.pyplot(f1, use_container_width=True)
-                with st.expander("Was bedeutet das?" if st.session_state["lang"] == "DE" else "What does this mean?", expanded=False):
-                    cheap = int(dfh.loc[dfh["tou_eur_per_kwh"].idxmin(), "hour"])
-                    green = int(dfh.loc[dfh["grid_co2_g_per_kwh"].idxmin(), "hour"])
-                    st.markdown(
-                        f"- Günstigste Stunde liegt ca. bei **{cheap:02d}:00**.\n"
-                        f"- Niedrigstes Netz-CO₂ liegt ca. bei **{green:02d}:00**.\n"
-                        "- Dein Zeitfenster gewichtet Preis & CO₂ — beides kann auseinanderlaufen.\n"
-                        "- Praxis: Wenn du Kosten drücken willst → Richtung günstiger Stunden; wenn CO₂ → Richtung CO₂-Minimum.\n"
-                        if st.session_state["lang"] == "DE" else
-                        f"- Cheapest hour is around **{cheap:02d}:00**.\n"
-                        f"- Lowest grid CO₂ hour is around **{green:02d}:00**.\n"
-                        "- Your charging window weights both price and CO₂ — they don’t necessarily match.\n"
-                        "- Practical: optimise for cost vs CO₂ depending on your goal.\n"
-                    )
-
-                gs_hr()
-
-                # --- Chart 2 ---
-                f2 = fig_load(dfh, res["inputs"]["site_capacity_limit_kva"], res["load"]["new_theoretical_peak_kw"])
-                st.pyplot(f2, use_container_width=True)
-                with st.expander("Was bedeutet das?" if st.session_state["lang"] == "DE" else "What does this mean?", expanded=False):
-                    peak = float(res["load"]["new_theoretical_peak_kw"])
-                    cap = float(res["inputs"].get("site_capacity_limit_kva", 0.0))
-                    ok = bool(res["load"].get("capacity_ok", True))
-                    st.markdown(
-                        f"- **Theoretischer Peak** (alle Lader voll): **{peak:,.0f} kW**.\n"
-                        + (f"- **Standort-Limit**: **{cap:,.0f} kVA**.\n" if cap > 0 else "")
-                        + (f"- Status: **{'OK' if ok else 'ÜBERSCHRITTEN'}**.\n" if st.session_state["lang"] == "DE" else
-                        f"- Status: **{'OK' if ok else 'EXCEEDED'}**.\n")
-                        + ("- Wenn überschritten: Lastmanagement, Ladefenster entzerren, geringere Ladeleistung, oder Anschluss ausbauen.\n"
-                        if st.session_state["lang"] == "DE" else
-                        "- If exceeded: load management, stagger charging, reduce charger power, or increase site capacity.\n")
-                    )
-
-                gs_hr()
-
-                # --- Chart 3 ---
-                f3 = fig_waterfall(res)
-                st.pyplot(f3, use_container_width=True)
-                with st.expander("Was bedeutet das?" if st.session_state["lang"] == "DE" else "What does this mean?", expanded=False):
-                    dv = res["diesel_vs_ev"]
-                    st.markdown(
-                        f"- Start ist **Diesel-Kosten** (Baseline).\n"
-                        f"- Dann wird **EV-Strom** abgezogen.\n"
-                        f"- **Maut-Ersparnis** kommt hinzu (falls EV mautbefreit).\n"
-                        f"- Ergebnis: **Netto-Einsparung** = **{float(dv.get('total_savings_incl_toll_eur',0.0)):,.0f} €/Jahr**.\n"
-                        if st.session_state["lang"] == "DE" else
-                        f"- Start is **diesel baseline cost**.\n"
-                        f"- Then **EV electricity cost** is subtracted.\n"
-                        f"- **Toll savings** added (if EV is toll-exempt).\n"
-                        f"- Result: **net savings** = **{float(dv.get('total_savings_incl_toll_eur',0.0)):,.0f} €/year**.\n"
-                    )
-
-                gs_hr()
-
-                # --- Chart 4 ---
-                f4 = fig_pareto_shifted_windows(res)
-                st.pyplot(f4, use_container_width=True)
-                with st.expander("Was bedeutet das?" if st.session_state["lang"] == "DE" else "What does this mean?", expanded=False):
-                    st.markdown(
-                        "- Jeder Punkt = gleich langes Ladefenster, nur **Startzeit verschoben**.\n"
-                        "- **Links** = günstiger, **unten** = weniger CO₂.\n"
-                        "- Die Zahl am Punkt ist die **Startstunde**.\n"
-                        "- Damit findest du schnell ein Ladefenster, das Kosten/CO₂ besser balanciert.\n"
-                        if st.session_state["lang"] == "DE" else
-                        "- Each point = same window length, shifted start time.\n"
-                        "- **Left** = cheaper, **down** = lower CO₂.\n"
-                        "- The label is the **start hour**.\n"
-                        "- Use this to pick a better cost/CO₂ trade-off window.\n"
-                    )
-
-
-            with tabs[2]:
-                df_calc = build_calculation_df(res)
-                st.dataframe(df_calc, use_container_width=True, hide_index=True)
-
-                with st.expander("Full model output (JSON)", expanded=False):
-                    st.json(res)
-
-            with tabs[3]:
-                st.caption("Tornado (±20% on key parameters) / Optional Monte-Carlo kannst du danach ergänzen.")
-                if st.button("Run tornado", use_container_width=True):
-                    base = res["inputs"].copy()
-                    base_savings = float(res["diesel_vs_ev"]["total_savings_incl_toll_eur"])
-
-                    params = [
-                        ("Electricity price (€/MWh)", "avg_elec_price_eur_per_mwh", 0.20),
-                        ("Diesel price (€/L)", "diesel_price_eur_per_l", 0.15),
-                        ("EV consumption (kWh/km)", "ev_consumption_kwh_per_km", 0.15),
-                        ("Diesel L/100km", "diesel_l_per_100km", 0.15),
-                        ("Events / truck / day", "events_per_truck_per_day", 0.20),
-                        ("Tolled share", "tolled_share_0_1", 0.20),
-                        ("Toll rate (€/km)", "toll_rate_eur_per_km", 0.20),
-                    ]
-
-                    impacts = []
-                    for label, key, pct in params:
-                        lo = base.copy()
-                        hi = base.copy()
-
-                        def clamp(k, v):
-                            if k in ("start_soc", "target_soc", "dynamic_price_share", "tolled_share_0_1"):
-                                return float(min(max(v, 0.0), 1.0))
-                            return float(max(v, 0.0))
-
-                        lo[key] = clamp(key, base[key] * (1 - pct))
-                        hi[key] = clamp(key, base[key] * (1 + pct))
-
-                        r_lo = run_model(**lo)
-                        r_hi = run_model(**hi)
-                        s_lo = float(r_lo["diesel_vs_ev"]["total_savings_incl_toll_eur"]) - base_savings
-                        s_hi = float(r_hi["diesel_vs_ev"]["total_savings_incl_toll_eur"]) - base_savings
-
-                        impacts.append((label, s_lo, s_hi))
-
-                    df_imp = pd.DataFrame(impacts, columns=["Parameter", "Delta_low", "Delta_high"])
-                    df_imp["Range"] = (df_imp["Delta_high"] - df_imp["Delta_low"]).abs()
-                    df_imp = df_imp.sort_values("Range", ascending=False)
-
-                    fig, ax = plt.subplots(figsize=(9, 5))
-                    y = np.arange(len(df_imp))
-                    left = df_imp[["Delta_low", "Delta_high"]].min(axis=1)
-                    right = df_imp[["Delta_low", "Delta_high"]].max(axis=1)
-                    ax.barh(y, right - left, left=left)
-                    ax.axvline(0, linestyle="--", alpha=0.5)
-                    ax.set_yticks(y)
-                    ax.set_yticklabels(df_imp["Parameter"])
-                    ax.set_xlabel("Impact on total savings (€/year)")
-                    ax.grid(True, axis="x", alpha=0.2)
-                    fig.tight_layout()
-                    st.pyplot(fig, use_container_width=True)
-
-            with tabs[4]:
-                df_calc = build_calculation_df(res)
-                dfh = build_hourly_df(res)
-
-                st.download_button(
-                    "Download results.json",
-                    data=json.dumps(res, ensure_ascii=False, indent=2),
-                    file_name="fleetmate_results.json",
-                    mime="application/json",
-                    use_container_width=True
-                )
-                st.download_button(
-                    "Download calculations.csv",
-                    data=df_calc.to_csv(index=False).encode("utf-8"),
-                    file_name="fleetmate_calculations.csv",
-                    mime="text/csv",
-                    use_container_width=True
-                )
-
-                # PDF with charts
-                charts = [
-                    ("TOU price & grid CO₂", fig_to_png_bytes(fig_price_co2(dfh))),
-                    ("Site load profile", fig_to_png_bytes(fig_load(dfh, res["inputs"]["site_capacity_limit_kva"], res["load"]["new_theoretical_peak_kw"]))),
-                    ("Cost waterfall", fig_to_png_bytes(fig_waterfall(res))),
-                    ("Pareto (shift window)", fig_to_png_bytes(fig_pareto_shifted_windows(res))),
-                ]
-
-                kpis = {
-                    f"{t('kpi_savings')} ({t('per_year')})": fmt_eur(res["diesel_vs_ev"]["total_savings_incl_toll_eur"]),
-                    f"{t('kpi_co2')} ({t('per_year')})": fmt_kg(res["diesel_vs_ev"]["co2_savings_kg"]),
-                    t("kpi_peak"): f"{fmt_num(res['load']['new_theoretical_peak_kw'])} kW",
-                    ("EV cost / year" if st.session_state["lang"] == "EN" else "EV-Kosten / Jahr"): fmt_eur(res["energy_cost"]["annual_cost_eur"]),
-                }
-
-                title = "FleetMate — Report"
-                pdf_bytes = build_report_pdf_bytes(
-                    title=title,
-                    kpis=kpis,
-                    narrative_md=st.session_state.get("report_md") or "",
-                    issues=detect_issues(res),
-                    solutions=generate_solution_set(res, detect_issues(res)),
-                    lang=st.session_state.get("lang", "EN"),
-                    charts=charts,
-                )
-
-                st.download_button(
-                    "⬇️ Download PDF report (with charts)" if st.session_state["lang"] == "EN" else "⬇️ PDF-Report (mit Charts) downloaden",
-                    data=pdf_bytes,
-                    file_name="fleetmate_report_with_charts.pdf",
-                    mime="application/pdf",
-                    use_container_width=True
-                )
+                        st.download_button(
+                            "⬇️ Download PDF report" if st.session_state["lang"] == "EN" else "⬇️ PDF-Report downloaden",
+                            data=pdf_bytes,
+                            file_name="fleetmate_report.pdf",
+                            mime="application/pdf",
+                            use_container_width=True,
+                            key="dl_pdf_report",
+                        )

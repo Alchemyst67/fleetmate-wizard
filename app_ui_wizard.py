@@ -1,32 +1,49 @@
+# FleetMate — patched Streamlit app (2026-01-10)
+# - Removes manual SoC inputs; derives SoC from km/day
+# - EV consumption defaults adjusted to realistic range (0.8–1.2)
+# - Replaces "dynamic share" with Fixed vs Dynamic price mode
+# - Adds load profile CSV upload + charging-window capacity analysis
+# - Updates toll defaults to ASFINAG-like values (simplified)
+# - Adds clearer finance charts ordering
+#
+# NOTE: This file assumes `recommendations.py` exists next to it with:
+#   - detect_issues(results: dict) -> list
+#   - generate_solution_set(results: dict, issues: list) -> list
+#
+# Run: streamlit run fleetmate_app_patched.py
+
 import os
 import json
 import re
-import requests
-import streamlit as st
 import io
 import datetime
 import hmac
+import hashlib
+
+import requests
+import streamlit as st
 import numpy as np
 import pandas as pd
 import matplotlib
-matplotlib.use("Agg")  # wichtig im Docker/Headless
+matplotlib.use("Agg")  # important in Docker/Headless
 import matplotlib.pyplot as plt
-
 
 from recommendations import detect_issues, generate_solution_set
 
+
+# =========================================================
+# Auth
+# =========================================================
 def require_login():
-    # Passwort aus Secrets (Cloud) oder Env
+    """Simple password gate (shared-secret)."""
     try:
         expected = str(st.secrets.get("APP_PASSWORD", "")).strip()
     except Exception:
         expected = ""
     if not expected:
-        expected = ""  # optional: fallback via os.getenv("APP_PASSWORD")
+        expected = os.getenv("APP_PASSWORD", "").strip()  # optional env fallback
 
-    if "authed" not in st.session_state:
-        st.session_state["authed"] = False
-
+    st.session_state.setdefault("authed", False)
     if st.session_state["authed"]:
         return
 
@@ -46,8 +63,9 @@ def require_login():
 
     st.stop()
 
+
 # =========================================================
-# Core constants + model (same logic)
+# Core constants + model (same general logic)
 # =========================================================
 DIESEL_CO2_PER_L = 2.64  # kg CO2 per litre
 
@@ -56,6 +74,7 @@ GRID_CO2_G_PER_KWH = [
     45, 45, 50, 60, 70, 80, 90, 95, 90, 83, 78, 76
 ]
 
+# Fallback time-of-use curve (only used if no dynamic spot data is available)
 TOU_PRICE_EUR_PER_KWH = [
     0.20, 0.195, 0.19, 0.185, 0.18, 0.18, 0.185, 0.19,
     0.21, 0.24, 0.23, 0.22, 0.20, 0.20, 0.205, 0.21,
@@ -64,6 +83,7 @@ TOU_PRICE_EUR_PER_KWH = [
 
 
 def compute_flags_and_shares(start_hour: int, end_hour: int):
+    """Return 24 hourly flags + shares (1 inside the window)."""
     flags = [0] * 24
     for h in range(24):
         if start_hour < end_hour:
@@ -77,18 +97,45 @@ def compute_flags_and_shares(start_hour: int, end_hour: int):
     return flags, shares
 
 
-def effective_grid_co2_kg_per_kwh(shares):
-    g = sum(c * s for c, s in zip(GRID_CO2_G_PER_KWH, shares))
-    return g / 1000.0
+def effective_grid_co2_details(shares):
+    """Window-weighted grid CO2 (hourly curve)."""
+    day_avg_g = float(sum(GRID_CO2_G_PER_KWH)) / 24.0
+    window_avg_g = float(sum(c * s for c, s in zip(GRID_CO2_G_PER_KWH, shares)))
+    return (window_avg_g / 1000.0), {
+        "grid_day_avg_g_per_kwh": day_avg_g,
+        "grid_window_avg_g_per_kwh": window_avg_g,
+        "grid_window_avg_kg_per_kwh": window_avg_g / 1000.0,
+    }
 
 
-def effective_energy_price_details(avg_price_eur_per_mwh: float, dynamic_share: float, shares):
+def effective_energy_price_details(
+    avg_price_eur_per_mwh: float,
+    dynamic_share: float,
+    shares,
+    spot_curve_avg_eur_per_kwh: float | None = None,
+    spot_window_avg_eur_per_kwh: float | None = None,
+):
+    """
+    Effective electricity price (€/MWh).
+
+    - FIXED mode -> dynamic_share will be 0.0 -> returns avg_price (no TOU weighting)
+    - DYNAMIC mode -> dynamic_share will be 1.0:
+        - If spot_curve_avg/window_avg are available -> effective == spot_window_avg (correct)
+        - Else fallback to TOU curve scaling (rough estimate)
+    """
     avg_price_eur_per_kwh = max(0.0, float(avg_price_eur_per_mwh)) / 1000.0
     dynamic_share = min(max(float(dynamic_share), 0.0), 1.0)
 
+    # Default: TOU curve (fallback only)
     curve_avg = float(sum(TOU_PRICE_EUR_PER_KWH)) / 24.0
     window_avg = float(sum(p * s for p, s in zip(TOU_PRICE_EUR_PER_KWH, shares)))
     rel = (window_avg / curve_avg) if curve_avg > 0 else 1.0
+
+    # If we have real spot data, use its window/day ratio instead of TOU heuristic
+    if spot_curve_avg_eur_per_kwh is not None and spot_window_avg_eur_per_kwh is not None:
+        curve_avg = float(max(1e-9, spot_curve_avg_eur_per_kwh))
+        window_avg = float(spot_window_avg_eur_per_kwh)
+        rel = window_avg / curve_avg
 
     fixed_part = avg_price_eur_per_kwh * (1.0 - dynamic_share)
     dynamic_part = avg_price_eur_per_kwh * dynamic_share * rel
@@ -97,23 +144,14 @@ def effective_energy_price_details(avg_price_eur_per_mwh: float, dynamic_share: 
     eff_eur_per_mwh = eff_eur_per_kwh * 1000.0
     details = {
         "avg_price_eur_per_kwh": avg_price_eur_per_kwh,
-        "tou_curve_avg_eur_per_kwh": curve_avg,
-        "tou_window_avg_eur_per_kwh": window_avg,
-        "tou_rel_factor": rel,
+        "curve_avg_eur_per_kwh": curve_avg,
+        "window_avg_eur_per_kwh": window_avg,
+        "rel_factor": rel,
         "dynamic_share": dynamic_share,
         "effective_price_eur_per_mwh": eff_eur_per_mwh,
+        "used_spot_data": bool(spot_curve_avg_eur_per_kwh is not None and spot_window_avg_eur_per_kwh is not None),
     }
     return eff_eur_per_mwh, details
-
-
-def effective_grid_co2_details(shares):
-    day_avg_g = float(sum(GRID_CO2_G_PER_KWH)) / 24.0
-    window_avg_g = float(sum(c * s for c, s in zip(GRID_CO2_G_PER_KWH, shares)))
-    return (window_avg_g / 1000.0), {
-        "grid_day_avg_g_per_kwh": day_avg_g,
-        "grid_window_avg_g_per_kwh": window_avg_g,
-        "grid_window_avg_kg_per_kwh": window_avg_g / 1000.0,
-    }
 
 
 def run_model(
@@ -139,7 +177,19 @@ def run_model(
     ev_toll_exempt: bool,
     desired_peak_limit_kw: float,
     peak_duration_h: float,
+    # Optional spot price stats (from upload)
+    spot_curve_avg_eur_per_kwh: float | None = None,
+    spot_window_avg_eur_per_kwh: float | None = None,
 ):
+    """
+    Core business-case model.
+
+    NOTE:
+    - We keep start_soc/target_soc in the model for backward compatibility.
+      In the UI, they are derived from km/day (not user inputs anymore).
+    - We keep dynamic_price_share internally (0=fixed, 1=dynamic) for compatibility.
+      In the UI, the user chooses a price mode instead of entering a share.
+    """
     num_trucks = max(1, int(num_trucks))
     operating_days = max(1, int(operating_days))
     events_per_truck_per_day = max(0.0, float(events_per_truck_per_day))
@@ -156,7 +206,7 @@ def run_model(
     end_h = int(end_hour) % 24
     flags, shares = compute_flags_and_shares(start_h, end_h)
 
-    # Energy
+    # Energy from SoC diff
     soc_diff = max(0.0, target_soc - start_soc)
     energy_per_event_kwh = battery_kwh * soc_diff
     energy_per_event_mwh = energy_per_event_kwh / 1000.0
@@ -165,7 +215,11 @@ def run_model(
     annual_energy_mwh = total_daily_energy_mwh * operating_days
 
     eff_price_eur_per_mwh, price_details = effective_energy_price_details(
-        avg_elec_price_eur_per_mwh, dynamic_price_share, shares
+        avg_elec_price_eur_per_mwh,
+        dynamic_price_share,
+        shares,
+        spot_curve_avg_eur_per_kwh=spot_curve_avg_eur_per_kwh,
+        spot_window_avg_eur_per_kwh=spot_window_avg_eur_per_kwh,
     )
 
     annual_cost_eur = annual_energy_mwh * eff_price_eur_per_mwh
@@ -175,7 +229,7 @@ def run_model(
     annual_energy_kwh = annual_energy_mwh * 1000.0
     annual_ev_co2_kg = annual_energy_kwh * eff_grid_co2_kg_per_kwh
 
-    # Distance (derived)
+    # Distance (derived from energy + consumption)
     daily_energy_kwh = total_daily_energy_mwh * 1000.0
     kwh_per_truck_per_day = daily_energy_kwh / num_trucks
     km_per_truck_per_day = kwh_per_truck_per_day / ev_consumption_kwh_per_km
@@ -241,18 +295,21 @@ def run_model(
             "flags": flags,
             "shares": shares,
             "grid_co2_g_per_kwh": GRID_CO2_G_PER_KWH,
-            "tou_price_eur_per_kwh": TOU_PRICE_EUR_PER_KWH,
+            "tou_price_eur_per_kwh": TOU_PRICE_EUR_PER_KWH,  # may be overridden for charts
         },
         "energy_cost": {
             "soc_diff": soc_diff,
+            "energy_per_event_kwh": energy_per_event_kwh,
             "total_daily_energy_mwh": total_daily_energy_mwh,
             "annual_energy_mwh": annual_energy_mwh,
             "effective_price_eur_per_mwh": eff_price_eur_per_mwh,
             "annual_cost_eur": annual_cost_eur,
+            "price_details": price_details,
         },
         "co2": {
             "effective_grid_co2_kg_per_kwh": eff_grid_co2_kg_per_kwh,
             "annual_ev_co2_kg": annual_ev_co2_kg,
+            "co2_details": co2_details,
         },
         "distance": {
             "km_per_truck_per_day": km_per_truck_per_day,
@@ -281,31 +338,43 @@ def run_model(
 
 
 # =========================================================
-# Defaults + persistent input storage (FIX for "values reset")
+# Defaults + persistent input storage
 # =========================================================
 DEFAULT_LANG = "DE"
 
 DEFAULT_INPUTS = dict(
     # Fleet
     num_trucks=10,
-    operating_days=260,
+    operating_days=360,
     events_per_truck=1.0,
 
-    # Battery / usage
+    # Usage (NEW): km/day (replaces SoC inputs)
+    km_per_truck_per_day=220.0,
+
+    # Battery / consumption
     vehicle_profile="heavy_regional",
     battery_kwh=500.0,
-    start_soc=0.20,   # empty default = 20%
-    target_soc=1.00,  # target default = 100%
-    ev_consumption=1.8,
+    # SoC is now derived from km/day (kept for internal compatibility)
+    start_soc=0.20,
+    target_soc=1.00,
 
-    # Electricity / time
-    avg_elec_price_mwh=200.0,  # €/MWh (=0.20 €/kWh)
-    dynamic_share=0.30,        # 30%
-    start_hour=22,             # overnight
-    end_hour=8,                # overnight
-    charging_window_hours=10.0,  # default = window length for 22–08
+    # EV consumption default adjusted (was too high)
+    ev_consumption=1.0,
 
-    # Site / capacity (realistic depot-ish starting values)
+    # Electricity
+    price_mode="fixed",           # "fixed" | "dynamic"
+    fixed_elec_price_mwh=200.0,   # used when price_mode=fixed
+    # Internals (computed):
+    avg_elec_price_mwh=200.0,     # gets set to fixed price or last-year spot average
+    dynamic_share=0.0,            # 0=fixed, 1=dynamic
+
+    # Charging window
+    start_hour=22,
+    end_hour=8,
+    charging_window_hours=10.0,
+
+    # Site / capacity
+    # Manual fallback (if no load profile uploaded)
     existing_peak_kw=300.0,
     charger_power_kw=150.0,
     site_capacity_kva=630.0,
@@ -318,21 +387,33 @@ DEFAULT_INPUTS = dict(
     market_region="AT",
     diesel_price=1.75,
     diesel_l_per_100=28.0,
-    toll_rate=0.25,
+
+    # Toll (default updated; simplified ASFINAG-style rate for 4+ axles EURO VI-ish)
+    # NOTE: Real GO-toll depends on axles + emission classes + special sections. Keep editable.
+    toll_rate=0.456,     # €/km (excl. VAT), representative for 4+ axles EURO VI in 2025
     tolled_share=0.60,
     ev_toll_exempt=True,
 )
 
-# Gemini may only update these (avoid letting the LLM switch profiles/regions)
-ALLOWED_INPUT_KEYS = set(DEFAULT_INPUTS.keys()) - {"vehicle_profile", "market_region"}
+# Gemini may only update these (avoid letting the LLM switch profiles/regions or hidden internals)
+HIDDEN_OR_CONTROLLED = {
+    "vehicle_profile", "market_region",
+    "start_soc", "target_soc",
+    "avg_elec_price_mwh", "dynamic_share",
+    "charging_window_hours",
+}
+ALLOWED_INPUT_KEYS = set(DEFAULT_INPUTS.keys()) - HIDDEN_OR_CONTROLLED
 
 
 def ensure_defaults():
     st.session_state.setdefault("lang", DEFAULT_LANG)
     st.session_state.setdefault("inputs", DEFAULT_INPUTS.copy())
 
+    # Flow control
     st.session_state.setdefault("flow", "wizard")  # wizard | report
     st.session_state.setdefault("wizard_step", 0)
+
+    # Model and report caches
     st.session_state.setdefault("model_results", None)
     st.session_state.setdefault("report_md", None)
     st.session_state.setdefault("report_meta", None)
@@ -340,6 +421,17 @@ def ensure_defaults():
     st.session_state.setdefault("assistant_messages", [])
     st.session_state.setdefault("last_gemini_payload", None)
     st.session_state.setdefault("charts_md", None)
+
+    # Upload cache
+    st.session_state.setdefault("profile_cache", {
+        "digest": None,
+        "df": None,
+        "timestamp_col": None,
+        "consumption_col": None,
+        "price_col": None,
+        "meta": {},
+        "metrics": {},
+    })
 
 
 def get_inp(k: str):
@@ -360,8 +452,243 @@ def window_len_hours(start_h: int, end_h: int) -> int:
     return 24
 
 
-# --- Wizard persistence fix ---
-# Widgets use step-scoped keys; values are synced into st.session_state["inputs"] (persistent).
+# =========================================================
+# Derived inputs (SoC + pricing)
+# =========================================================
+def derive_soc_from_km(inputs: dict) -> dict:
+    """
+    Derive start_soc/target_soc from km/day.
+
+    Assumption (simple & customer-friendly):
+    - The truck starts the day fully charged (target_soc = 100%).
+    - km/day consumes energy = km * kWh/km.
+    - If events/day > 1, km are split evenly across charging events.
+
+    Returns dict with:
+      start_soc, target_soc, soc_diff, km_per_event, energy_per_event_kwh, daily_energy_kwh, warning
+    """
+    km_day = float(max(0.0, inputs.get("km_per_truck_per_day", 0.0)))
+    events = float(max(0.0, inputs.get("events_per_truck", 0.0)))
+    events = events if events > 0 else 1.0
+
+    battery_kwh = float(max(1e-9, inputs.get("battery_kwh", 0.0)))
+    cons = float(max(0.01, inputs.get("ev_consumption", 0.01)))
+
+    km_per_event = km_day / events
+    energy_per_event_kwh = km_per_event * cons
+    daily_energy_kwh = km_day * cons
+
+    soc_diff = min(1.0, energy_per_event_kwh / battery_kwh) if battery_kwh > 0 else 1.0
+    start_soc = max(0.0, 1.0 - soc_diff)
+    target_soc = 1.0
+
+    warn = None
+    if daily_energy_kwh > battery_kwh * 0.98 and events <= 1.01:
+        warn = "Die km/Tag übersteigen (nahezu) die Batteriekapazität. Entweder mehrmals laden oder Batterie/Verbrauch prüfen."
+    if soc_diff >= 0.98:
+        warn = warn or "Pro Lade-Event fast Vollzyklus — prüfe km/Tag, Verbrauch oder Batteriegröße."
+
+    return {
+        "start_soc": start_soc,
+        "target_soc": target_soc,
+        "soc_diff": soc_diff,
+        "km_per_event": km_per_event,
+        "energy_per_event_kwh": energy_per_event_kwh,
+        "daily_energy_kwh": daily_energy_kwh,
+        "warning": warn,
+    }
+
+
+def apply_pricing_mode(inputs: dict, spot_metrics: dict | None) -> dict:
+    """
+    Map price_mode -> internal avg_elec_price_mwh + dynamic_share.
+
+    - fixed: user enters fixed_elec_price_mwh, dynamic_share=0.0, avg_elec_price_mwh=fixed
+    - dynamic: avg_elec_price_mwh = last-year spot average from upload (if available),
+               dynamic_share=1.0
+               If no spot data, fall back to fixed_elec_price_mwh but keep dynamic_share=1.0
+               (and the model will use TOU as a rough proxy).
+    """
+    mode = str(inputs.get("price_mode", "fixed")).strip().lower()
+    fixed_mwh = float(max(0.0, inputs.get("fixed_elec_price_mwh", 0.0)))
+
+    if mode == "dynamic":
+        inputs["dynamic_share"] = 1.0
+        if spot_metrics and spot_metrics.get("spot_day_avg_eur_per_mwh") is not None:
+            inputs["avg_elec_price_mwh"] = float(max(0.0, spot_metrics["spot_day_avg_eur_per_mwh"]))
+        else:
+            inputs["avg_elec_price_mwh"] = fixed_mwh  # fallback
+    else:
+        inputs["price_mode"] = "fixed"
+        inputs["dynamic_share"] = 0.0
+        inputs["avg_elec_price_mwh"] = fixed_mwh
+
+    return inputs
+
+
+# =========================================================
+# CSV load profile upload + parsing
+# =========================================================
+def _guess_timestamp_col(df: pd.DataFrame) -> str | None:
+    for c in df.columns:
+        cl = str(c).lower()
+        if cl in ("timestamp", "datetime", "date_time", "time", "date"):
+            return c
+    # If first column looks like datetime, use it
+    if len(df.columns) > 0:
+        c0 = df.columns[0]
+        s = df[c0].astype(str).head(5).tolist()
+        if any((":" in x and "-" in x) or ("T" in x) for x in s):
+            return c0
+    return None
+
+
+def _guess_consumption_col(df: pd.DataFrame) -> str | None:
+    # Prefer typical naming
+    prefs = ["consumption_kw", "consumption_kW", "load_kw", "site_load_kw", "consumption", "load"]
+    for p in prefs:
+        for c in df.columns:
+            if str(c).lower() == p.lower():
+                return c
+    # Heuristic: any numeric column containing 'consumption' or 'load' or 'kw'
+    cand = []
+    for c in df.columns:
+        cl = str(c).lower()
+        if any(k in cl for k in ["consumption", "load"]) and ("pv" not in cl):
+            cand.append(c)
+    if not cand:
+        for c in df.columns:
+            cl = str(c).lower()
+            if "kw" in cl and "pv" not in cl:
+                cand.append(c)
+    # Pick first numeric
+    for c in cand:
+        try:
+            pd.to_numeric(df[c].dropna().head(50))
+            return c
+        except Exception:
+            continue
+    return None
+
+
+def _guess_price_col(df: pd.DataFrame) -> str | None:
+    # Optional (only used in dynamic price mode)
+    for c in df.columns:
+        cl = str(c).lower()
+        if "price" in cl:
+            return c
+    return None
+
+
+def parse_uploaded_csv(upload) -> pd.DataFrame | None:
+    """Parse uploaded CSV with best-effort delimiter and date parsing."""
+    if upload is None:
+        return None
+    try:
+        data = upload.getvalue()
+        if not data:
+            return None
+        bio = io.BytesIO(data)
+        # sep=None triggers python engine sniffing; handles commas/semicolons often
+        df = pd.read_csv(bio, sep=None, engine="python")
+        if df is None or df.empty:
+            return None
+        return df
+    except Exception:
+        return None
+
+
+def _in_window_hours(hour: int, start_h: int, end_h: int) -> bool:
+    if start_h < end_h:
+        return start_h <= hour < end_h
+    if start_h > end_h:
+        return hour >= start_h or hour < end_h
+    return True
+
+
+def compute_profile_metrics(
+    df_raw: pd.DataFrame,
+    timestamp_col: str,
+    consumption_col: str,
+    price_col: str | None,
+    start_h: int,
+    end_h: int,
+) -> dict:
+    """
+    Compute capacity-relevant metrics from load profile.
+
+    We focus only on the charging window, because that's where charging happens.
+    - peak_kw_in_window: max site consumption during charging window (conservative)
+    - hourly_avg_kw / hourly_max_kw: for charts
+    - spot_* averages: from price column if available (supports €/MWh or €/kWh)
+    """
+    df = df_raw.copy()
+
+    # Timestamp parsing
+    ts = pd.to_datetime(df[timestamp_col], errors="coerce")
+    df = df.loc[ts.notna()].copy()
+    df["ts"] = ts.loc[ts.notna()].dt.tz_localize(None)
+
+    # Consumption numeric
+    df["site_kw"] = pd.to_numeric(df[consumption_col], errors="coerce")
+    df = df.loc[df["site_kw"].notna()].copy()
+
+    df["hour"] = df["ts"].dt.hour
+    df["in_window"] = df["hour"].apply(lambda h: _in_window_hours(int(h), start_h, end_h))
+
+    # Hourly series for charts
+    hourly_avg = df.groupby("hour")["site_kw"].mean().reindex(range(24))
+    hourly_max = df.groupby("hour")["site_kw"].max().reindex(range(24))
+    hourly_avg = hourly_avg.fillna(method="ffill").fillna(method="bfill").fillna(0.0)
+    hourly_max = hourly_max.fillna(method="ffill").fillna(method="bfill").fillna(0.0)
+
+    inw = df.loc[df["in_window"]]
+    peak_kw_in_window = float(inw["site_kw"].max()) if not inw.empty else float(df["site_kw"].max())
+
+    out = {
+        "peak_kw_in_window": peak_kw_in_window,
+        "hourly_avg_kw": [float(x) for x in hourly_avg.values],
+        "hourly_max_kw": [float(x) for x in hourly_max.values],
+        "has_price": False,
+        "spot_hourly_avg_eur_per_kwh": None,
+        "spot_day_avg_eur_per_mwh": None,
+        "spot_window_avg_eur_per_kwh": None,
+        "spot_curve_avg_eur_per_kwh": None,
+    }
+
+    if price_col:
+        pr = pd.to_numeric(df[price_col], errors="coerce")
+        df["price_raw"] = pr
+        df = df.loc[df["price_raw"].notna()].copy()
+
+        # Heuristic for units:
+        # - if values typically > 5 => likely €/MWh (e.g., -30..100), convert to €/kWh by /1000
+        # - else likely already €/kWh
+        median_abs = float(np.nanmedian(np.abs(df["price_raw"].values))) if len(df) else 0.0
+        if median_abs > 5.0:
+            df["price_eur_per_kwh"] = df["price_raw"] / 1000.0
+        else:
+            df["price_eur_per_kwh"] = df["price_raw"]
+
+        ph = df.groupby("hour")["price_eur_per_kwh"].mean().reindex(range(24))
+        ph = ph.fillna(method="ffill").fillna(method="bfill")
+        spot_curve_avg = float(df["price_eur_per_kwh"].mean()) if len(df) else None
+        spot_window_avg = float(df.loc[df["in_window"], "price_eur_per_kwh"].mean()) if df["in_window"].any() else spot_curve_avg
+
+        out.update({
+            "has_price": True,
+            "spot_hourly_avg_eur_per_kwh": [float(x) for x in ph.values],
+            "spot_curve_avg_eur_per_kwh": spot_curve_avg,
+            "spot_window_avg_eur_per_kwh": spot_window_avg,
+            "spot_day_avg_eur_per_mwh": (spot_curve_avg * 1000.0) if spot_curve_avg is not None else None,
+        })
+
+    return out
+
+
+# =========================================================
+# Wizard persistence helpers
+# =========================================================
 def wkey(step_id: str, field: str) -> str:
     return f"w_{step_id}_{field}"
 
@@ -414,10 +741,48 @@ def bind_select(step_id: str, field: str, label: str, options, format_func=None,
     st.selectbox(label, **select_kwargs)
 
 
-
+# =========================================================
+# Recalc orchestrator
+# =========================================================
 def recalc_from_inputs():
+    """
+    Central recalculation:
+    1) Apply derived SoC from km/day
+    2) Parse load profile (if uploaded) and apply:
+       - existing_peak_kw from charging-window peak
+       - spot-price averages (if dynamic)
+    3) Run core model
+    4) Attach capacity analysis to results (customer-friendly reverse calculation)
+    """
     inp = st.session_state["inputs"]
-    st.session_state["model_results"] = run_model(
+
+    # ---- Load profile (if any) ----
+    prof = st.session_state.get("profile_cache", {})
+    prof_metrics = prof.get("metrics") or {}
+
+    # ---- Derive SoC from km/day (no manual SoC inputs anymore) ----
+    derived = derive_soc_from_km(inp)
+    inp["start_soc"] = derived["start_soc"]
+    inp["target_soc"] = derived["target_soc"]
+
+    # ---- Pricing mode mapping (fixed vs dynamic) ----
+    inp = apply_pricing_mode(inp, prof_metrics if prof_metrics else None)
+
+    # ---- Existing site peak: prefer upload peak in charging window (if present) ----
+    existing_peak_kw = float(inp.get("existing_peak_kw", 0.0))
+    site_peak_source = "manual"
+    if prof_metrics and prof_metrics.get("peak_kw_in_window") is not None:
+        existing_peak_kw = float(max(0.0, prof_metrics["peak_kw_in_window"]))
+        site_peak_source = "load_profile"
+
+    # Spot stats (for dynamic price weighting)
+    spot_curve_avg = prof_metrics.get("spot_curve_avg_eur_per_kwh") if prof_metrics else None
+    spot_window_avg = prof_metrics.get("spot_window_avg_eur_per_kwh") if prof_metrics else None
+
+    inp["charging_window_hours"] = float(window_len_hours(int(inp["start_hour"]), int(inp["end_hour"])))
+
+    # ---- Run model ----
+    res = run_model(
         num_trucks=inp["num_trucks"],
         operating_days=inp["operating_days"],
         events_per_truck_per_day=inp["events_per_truck"],
@@ -429,7 +794,7 @@ def recalc_from_inputs():
         start_hour=inp["start_hour"],
         end_hour=inp["end_hour"],
         charging_window_hours=inp["charging_window_hours"],
-        existing_site_peak_kw=inp["existing_peak_kw"],
+        existing_site_peak_kw=existing_peak_kw,
         charger_power_per_truck_kw=inp["charger_power_kw"],
         site_capacity_limit_kva=inp["site_capacity_kva"],
         ev_consumption_kwh_per_km=inp["ev_consumption"],
@@ -440,7 +805,75 @@ def recalc_from_inputs():
         ev_toll_exempt=inp["ev_toll_exempt"],
         desired_peak_limit_kw=inp["desired_peak_limit_kw"],
         peak_duration_h=inp["peak_duration_h"],
+        spot_curve_avg_eur_per_kwh=spot_curve_avg,
+        spot_window_avg_eur_per_kwh=spot_window_avg,
     )
+
+    # ---- Attach profile metrics (serialisable) ----
+    res.setdefault("profile", {})
+    res["profile"].update({
+        "site_peak_source": site_peak_source,
+        "derived_soc": {
+            "km_per_truck_per_day": float(inp.get("km_per_truck_per_day", 0.0)),
+            "km_per_event": float(derived["km_per_event"]),
+            "soc_diff": float(derived["soc_diff"]),
+            "energy_per_event_kwh": float(derived["energy_per_event_kwh"]),
+            "daily_energy_kwh": float(derived["daily_energy_kwh"]),
+            "warning": derived.get("warning"),
+        }
+    })
+    if prof_metrics:
+        res["profile"].update({
+            "peak_kw_in_window": prof_metrics.get("peak_kw_in_window"),
+            "hourly_avg_kw": prof_metrics.get("hourly_avg_kw"),
+            "hourly_max_kw": prof_metrics.get("hourly_max_kw"),
+            "has_price": prof_metrics.get("has_price"),
+            "spot_hourly_avg_eur_per_kwh": prof_metrics.get("spot_hourly_avg_eur_per_kwh"),
+            "spot_curve_avg_eur_per_kwh": prof_metrics.get("spot_curve_avg_eur_per_kwh"),
+            "spot_window_avg_eur_per_kwh": prof_metrics.get("spot_window_avg_eur_per_kwh"),
+            "spot_day_avg_eur_per_mwh": prof_metrics.get("spot_day_avg_eur_per_mwh"),
+        })
+
+    # ---- Customer-friendly reverse calculation (capacity during charging window) ----
+    # Available kW = site capacity - site consumption peak in charging window
+    cap = float(max(0.0, inp.get("site_capacity_kva", 0.0)))
+    peak_in_window = float(existing_peak_kw)
+    avail_kw = max(0.0, cap - peak_in_window)
+
+    wh = window_len_hours(int(inp.get("start_hour", 0)), int(inp.get("end_hour", 0)))
+    # Energy available if you use the whole window at the available headroom
+    energy_avail_kwh = avail_kw * float(wh)
+
+    # Energy needed per truck per day (from km/day & consumption)
+    e_truck_day = float(derived["daily_energy_kwh"])
+    max_trucks_energy_based = int(np.floor(energy_avail_kwh / e_truck_day)) if e_truck_day > 1e-9 else 0
+
+    # "Naive" simultaneous charging at full power
+    charger_kw = float(max(0.01, inp.get("charger_power_kw", 0.01)))
+    max_trucks_simultaneous = int(np.floor(avail_kw / charger_kw)) if avail_kw > 0 else 0
+
+    # Recommended average charging power per truck to fit into effective charging time
+    eff_h = float(max(0.1, inp.get("charging_window_hours", 0.1)))
+    recommended_kw_per_truck = (e_truck_day / eff_h) if eff_h > 0 else None
+
+    res.setdefault("capacity_analysis", {})
+    res["capacity_analysis"].update({
+        "charging_window_hours_total": int(wh),
+        "site_capacity_kw": cap,
+        "site_peak_kw_in_window": peak_in_window,
+        "available_kw_at_peak": avail_kw,
+        "energy_available_kwh_in_window": energy_avail_kwh,
+        "energy_needed_kwh_per_truck_day": e_truck_day,
+        "max_trucks_energy_based": max_trucks_energy_based,
+        "max_trucks_simultaneous_at_full_power": max_trucks_simultaneous,
+        "recommended_avg_kw_per_truck": float(recommended_kw_per_truck) if recommended_kw_per_truck is not None else None,
+    })
+
+    # ---- For charts: override TOU with real hourly spot averages if available ----
+    if prof_metrics and prof_metrics.get("spot_hourly_avg_eur_per_kwh") is not None:
+        res["charging_profile"]["tou_price_eur_per_kwh"] = prof_metrics["spot_hourly_avg_eur_per_kwh"]
+
+    st.session_state["model_results"] = res
 
 
 # =========================================================
@@ -512,7 +945,7 @@ def t(key: str) -> str:
 
 
 # =========================================================
-# Gemini helpers
+# Gemini helpers (unchanged; only small key list update)
 # =========================================================
 def _extract_json(text: str) -> str:
     t0 = (text or "").strip()
@@ -546,18 +979,25 @@ def _compact_for_llm(results: dict) -> dict:
     dist = results.get("distance", {})
     load = results.get("load", {})
     inp = results.get("inputs", {})
+    cap = results.get("capacity_analysis", {})
+    prof = results.get("profile", {})
     return {
         "inputs": {
             "num_trucks": inp.get("num_trucks"),
             "operating_days": inp.get("operating_days"),
             "battery_kwh": inp.get("battery_kwh"),
-            "start_soc": inp.get("start_soc"),
-            "target_soc": inp.get("target_soc"),
+            "ev_consumption_kwh_per_km": inp.get("ev_consumption_kwh_per_km"),
             "avg_elec_price_eur_per_mwh": inp.get("avg_elec_price_eur_per_mwh"),
+            "dynamic_price_share": inp.get("dynamic_price_share"),
             "diesel_price_eur_per_l": inp.get("diesel_price_eur_per_l"),
             "diesel_l_per_100km": inp.get("diesel_l_per_100km"),
             "toll_rate_eur_per_km": inp.get("toll_rate_eur_per_km"),
             "ev_toll_exempt": inp.get("ev_toll_exempt"),
+        },
+        "derived": {
+            "km_per_truck_per_day_input": prof.get("derived_soc", {}).get("km_per_truck_per_day"),
+            "soc_diff_per_event": prof.get("derived_soc", {}).get("soc_diff"),
+            "site_peak_source": prof.get("site_peak_source"),
         },
         "key_results": {
             "annual_energy_mwh": ec.get("annual_energy_mwh"),
@@ -572,6 +1012,8 @@ def _compact_for_llm(results: dict) -> dict:
             "annual_km_fleet": dist.get("annual_km_fleet"),
             "new_theoretical_peak_kw": load.get("new_theoretical_peak_kw"),
             "capacity_ok": load.get("capacity_ok"),
+            "available_kw_at_peak": cap.get("available_kw_at_peak"),
+            "max_trucks_energy_based": cap.get("max_trucks_energy_based"),
         }
     }
 
@@ -709,118 +1151,9 @@ def call_gemini_report(results: dict, issues: list, solutions: list) -> str:
         text = ""
     return text or ""
 
-def explain_charts_deterministic(res: dict, dfh: pd.DataFrame, lang: str) -> str:
-    ec = res["energy_cost"]
-    dv = res["diesel_vs_ev"]
-    co2 = res["co2"]
-    load = res["load"]
-    inp = res["inputs"]
-
-    # Key numbers
-    annual_energy_mwh = float(ec.get("annual_energy_mwh", 0.0))
-    eff_price = float(ec.get("effective_price_eur_per_mwh", 0.0))
-    ev_cost = float(ec.get("annual_cost_eur", 0.0))
-    diesel_cost = float(dv.get("diesel_cost_baseline_eur", 0.0))
-    total_savings = float(dv.get("total_savings_incl_toll_eur", 0.0))
-    ev_co2 = float(co2.get("annual_ev_co2_kg", 0.0))
-    co2_savings = float(dv.get("co2_savings_kg", 0.0))
-    peak_kw = float(load.get("new_theoretical_peak_kw", 0.0))
-    cap_kva = float(inp.get("site_capacity_limit_kva", 0.0))
-    start_h = int(inp.get("start_hour", 0))
-    end_h = int(inp.get("end_hour", 0))
-    win_h = int(sum(res["charging_profile"]["flags"])) if "charging_profile" in res else None
-
-    # Simple “best hours” hints from df (price & co2)
-    df = dfh.copy()
-    df["score_price"] = df["tou_eur_per_kwh"]
-    df["score_co2"] = df["grid_co2_g_per_kwh"]
-    cheap_hour = int(df.loc[df["score_price"].idxmin(), "hour"])
-    green_hour = int(df.loc[df["score_co2"].idxmin(), "hour"])
-
-    if lang == "EN":
-        return (
-            "#### What the charts show\n"
-            f"- **TOU price & grid CO₂:** Cheapest hour ≠ greenest hour. In your data, cheapest is around **{cheap_hour:02d}:00**, greenest around **{green_hour:02d}:00**.\n"
-            f"- **Load profile:** Dashed line is the site limit. Your theoretical peak is **{peak_kw:,.0f} kW**"
-            + (f" vs limit **{cap_kva:,.0f} kVA**." if cap_kva > 0 else ".") + "\n"
-            "- **Waterfall:** Diesel cost → EV electricity cost → toll effect → net result.\n"
-            "- **Pareto (shift window):** Each label is a start-hour; further left = cheaper, lower = less CO₂.\n\n"
-            "#### Key figures behind the plots\n"
-            f"- Annual energy: **{annual_energy_mwh:,.0f} MWh/year** at **{eff_price:,.0f} €/MWh**\n"
-            f"- EV electricity cost: **{ev_cost:,.0f} €/year** vs diesel baseline **{diesel_cost:,.0f} €/year**\n"
-            f"- Total savings (incl. toll): **{total_savings:,.0f} €/year**\n"
-            f"- CO₂: EV **{ev_co2:,.0f} kg/year**, savings **{co2_savings:,.0f} kg/year**\n"
-        )
-
-    # DE
-    return (
-        "#### Was die Charts zeigen\n"
-        f"- **TOU-Preis & Netz-CO₂:** Günstigste Stunde ≠ „grünste“ Stunde. In deinen Daten: günstigste Stunde ca. **{cheap_hour:02d}:00**, niedrigstes CO₂ ca. **{green_hour:02d}:00**.\n"
-        f"- **Lastprofil:** Gestrichelt = Anschlusslimit. Dein theoretischer Peak liegt bei **{peak_kw:,.0f} kW**"
-        + (f" vs Limit **{cap_kva:,.0f} kVA**." if cap_kva > 0 else ".") + "\n"
-        "- **Waterfall:** Diesel-Kosten → EV-Stromkosten → Maut-Effekt → Netto.\n"
-        "- **Pareto (Fenster verschoben):** Jede Markierung ist eine Startstunde; weiter links = günstiger, weiter unten = weniger CO₂.\n\n"
-        "#### Wichtigste Zahlen hinter den Plots\n"
-        f"- Jahresenergie: **{annual_energy_mwh:,.0f} MWh/Jahr** bei **{eff_price:,.0f} €/MWh**\n"
-        f"- EV-Stromkosten: **{ev_cost:,.0f} €/Jahr** vs Diesel-Baseline **{diesel_cost:,.0f} €/Jahr**\n"
-        f"- Gesamteinsparung (inkl. Maut): **{total_savings:,.0f} €/Jahr**\n"
-        f"- CO₂: EV **{ev_co2:,.0f} kg/Jahr**, Ersparnis **{co2_savings:,.0f} kg/Jahr**\n"
-    )
-
-def call_gemini_charts(res: dict, dfh: pd.DataFrame) -> str:
-    api_key = _gemini_key()
-    if not api_key:
-        return ""
-
-    model = _gemini_model()
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-    params = {"key": api_key}
-
-    lang = st.session_state.get("lang", DEFAULT_LANG)
-    lang_instruction = "Write in German." if lang == "DE" else "Write in English."
-
-    compact = _compact_for_llm(res)
-
-    # very compact chart context (no heavy tables)
-    chart_ctx = {
-        "tou_min_hour": int(dfh.loc[dfh["tou_eur_per_kwh"].idxmin(), "hour"]),
-        "tou_max_hour": int(dfh.loc[dfh["tou_eur_per_kwh"].idxmax(), "hour"]),
-        "co2_min_hour": int(dfh.loc[dfh["grid_co2_g_per_kwh"].idxmin(), "hour"]),
-        "co2_max_hour": int(dfh.loc[dfh["grid_co2_g_per_kwh"].idxmax(), "hour"]),
-    }
-
-    prompt = (
-        "You are Eva. Explain the charts to a customer.\n"
-        f"{lang_instruction}\n"
-        "Be clear, honest, no fluff. Use bullets.\n"
-        "Max 10 bullets + 1 short paragraph.\n"
-        "Mention what the user should do next if capacity is exceeded.\n\n"
-        "MODEL RESULTS (compact):\n"
-        f"{json.dumps(compact, ensure_ascii=False)}\n\n"
-        "CHART CONTEXT:\n"
-        f"{json.dumps(chart_ctx, ensure_ascii=False)}\n"
-    )
-
-    payload = {
-        "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"temperature": 0.2, "maxOutputTokens": 450},
-    }
-
-    try:
-        resp = requests.post(url, params=params, json=payload, timeout=25)
-        if resp.status_code >= 300:
-            return ""
-        data = resp.json()
-        cands = data.get("candidates", [])
-        parts = cands[0].get("content", {}).get("parts", []) if cands else []
-        text = "\n".join([p.get("text", "") for p in parts if isinstance(p, dict) and p.get("text")]).strip()
-        return text or ""
-    except Exception:
-        return ""
-
 
 # =========================================================
-# UI helpers
+# UI helpers + formatting
 # =========================================================
 def fmt_eur(x):
     try:
@@ -847,6 +1180,9 @@ def gs_hr():
     st.markdown("<hr class='gs-hr'/>", unsafe_allow_html=True)
 
 
+# =========================================================
+# PDF export (unchanged)
+# =========================================================
 def _md_to_text(md: str) -> str:
     """Small markdown-to-text cleanup for PDF export."""
     if not md:
@@ -861,10 +1197,7 @@ def _md_to_text(md: str) -> str:
 
 
 def build_report_pdf_bytes(title: str, kpis: dict, narrative_md: str, issues: list, solutions: list, lang: str, charts: list = None) -> bytes:
-    """
-    Build a clean PDF using reportlab (no HTML renderer needed).
-    Returns b"" if reportlab is missing.
-    """
+    """Build a clean PDF using reportlab. Returns b'' if reportlab is missing."""
     try:
         from reportlab.lib.pagesizes import A4
         from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
@@ -873,7 +1206,6 @@ def build_report_pdf_bytes(title: str, kpis: dict, narrative_md: str, issues: li
         from reportlab.lib import colors
         from reportlab.platypus import Image as RLImage, PageBreak
         from reportlab.lib.utils import ImageReader
-
     except Exception:
         return b""
 
@@ -966,7 +1298,9 @@ def build_report_pdf_bytes(title: str, kpis: dict, narrative_md: str, issues: li
     return buf.getvalue()
 
 
-
+# =========================================================
+# App state utilities
+# =========================================================
 def reset_all():
     lang = st.session_state.get("lang", DEFAULT_LANG)
     st.session_state["inputs"] = DEFAULT_INPUTS.copy()
@@ -978,6 +1312,15 @@ def reset_all():
     st.session_state["report_pdf_bytes"] = None
     st.session_state["assistant_messages"] = []
     st.session_state["last_gemini_payload"] = None
+    st.session_state["profile_cache"] = {
+        "digest": None,
+        "df": None,
+        "timestamp_col": None,
+        "consumption_col": None,
+        "price_col": None,
+        "meta": {},
+        "metrics": {},
+    }
 
 
 def apply_pending_flow():
@@ -985,8 +1328,6 @@ def apply_pending_flow():
     v = st.session_state.pop("pending_flow_switch", None)
     if v in ("wizard", "report"):
         st.session_state["flow"] = v
-        # Important: do NOT set the widget key directly here.
-        # Instead, remove it so the radio can initialise cleanly (no Streamlit warning).
         if "flow_switch" in st.session_state:
             del st.session_state["flow_switch"]
 
@@ -1021,6 +1362,10 @@ def handle_user_chat(msg: str, current_step_name: str):
         ack = "✅ Updated inputs and recalculated." if st.session_state.get("lang") == "EN" else "✅ Inputs aktualisiert und neu berechnet."
         st.session_state["assistant_messages"].append({"role": "assistant", "content": ack})
 
+
+# =========================================================
+# Tables & chart dataframes
+# =========================================================
 def build_calculation_df(res: dict) -> pd.DataFrame:
     inp = res["inputs"]
     ec = res["energy_cost"]
@@ -1028,92 +1373,107 @@ def build_calculation_df(res: dict) -> pd.DataFrame:
     co2 = res["co2"]
     dist = res["distance"]
     load = res["load"]
+    cap = res.get("capacity_analysis", {})
+    prof = res.get("profile", {}).get("derived_soc", {})
 
-    soc_diff = ec.get("soc_diff", 0.0)
-    energy_event_mwh = (ec.get("total_daily_energy_mwh", 0.0) / max(inp["num_trucks"] * inp["events_per_truck_per_day"], 1e-9))
-    energy_event_kwh = energy_event_mwh * 1000.0
-
-    annual_km = dist.get("annual_km_fleet", 0.0)
-    annual_energy_mwh = ec.get("annual_energy_mwh", 0.0)
-    annual_cost = ec.get("annual_cost_eur", 0.0)
+    annual_km = float(dist.get("annual_km_fleet", 0.0))
+    annual_energy_mwh = float(ec.get("annual_energy_mwh", 0.0))
+    annual_cost = float(ec.get("annual_cost_eur", 0.0))
 
     cost_per_km = (annual_cost / annual_km) if annual_km > 0 else np.nan
-    ev_co2_per_km = (co2.get("annual_ev_co2_kg", 0.0) / annual_km) if annual_km > 0 else np.nan
-    diesel_co2_per_km = (dv.get("diesel_co2_baseline_kg", 0.0) / annual_km) if annual_km > 0 else np.nan
+    ev_co2_per_km = (float(co2.get("annual_ev_co2_kg", 0.0)) / annual_km) if annual_km > 0 else np.nan
+    diesel_co2_per_km = (float(dv.get("diesel_co2_baseline_kg", 0.0)) / annual_km) if annual_km > 0 else np.nan
 
     rows = [
-        ("SoC diff", "max(0, target_soc - start_soc)", soc_diff, "—"),
-        ("Energy per event", "battery_kwh * soc_diff", energy_event_kwh, "kWh"),
-        ("Daily energy", "num_trucks * events/day * energy/event", ec.get("total_daily_energy_mwh", 0.0) * 1000.0, "kWh/day"),
+        ("km/day input", "km_per_truck_per_day", prof.get("km_per_truck_per_day", np.nan), "km/day"),
+        ("Energy per truck/day", "km/day * kWh/km", prof.get("daily_energy_kwh", np.nan), "kWh/day"),
+        ("Energy per event", "(km/day/events) * kWh/km", prof.get("energy_per_event_kwh", np.nan), "kWh"),
+        ("SoC diff per event", "energy_event / battery_kwh", prof.get("soc_diff", np.nan), "0–1"),
+        ("Daily energy (fleet)", "num_trucks * events/day * energy/event", float(ec.get("total_daily_energy_mwh", 0.0)) * 1000.0, "kWh/day"),
         ("Annual energy", "daily_energy * operating_days", annual_energy_mwh, "MWh/year"),
-        ("Effective electricity price", "avg_price adjusted by TOU (dynamic_share)", ec.get("effective_price_eur_per_mwh", 0.0), "€/MWh"),
+        ("Effective electricity price", "fixed or dynamic (window)", float(ec.get("effective_price_eur_per_mwh", 0.0)), "€/MWh"),
         ("EV electricity cost", "annual_energy_mwh * effective_price", annual_cost, "€/year"),
-        ("Diesel litres baseline", "annual_km * L/100km / 100", dv.get("diesel_cost_baseline_eur", 0.0) / max(inp["diesel_price_eur_per_l"], 1e-9), "L/year"),
-        ("Diesel cost baseline", "diesel_litres * diesel_price", dv.get("diesel_cost_baseline_eur", 0.0), "€/year"),
-        ("Baseline toll cost", "annual_km * tolled_share * toll_rate", dv.get("baseline_toll_cost_eur", 0.0), "€/year"),
-        ("Total savings incl. toll", "diesel_cost - ev_cost + toll_savings", dv.get("total_savings_incl_toll_eur", 0.0), "€/year"),
-        ("EV CO₂", "annual_kWh * grid_CO2_window", co2.get("annual_ev_co2_kg", 0.0), "kg/year"),
-        ("Diesel CO₂ baseline", "diesel_litres * 2.64", dv.get("diesel_co2_baseline_kg", 0.0), "kg/year"),
-        ("CO₂ savings", "diesel_CO2 - ev_CO2", dv.get("co2_savings_kg", 0.0), "kg/year"),
-        ("Theoretical peak (new)", "existing_peak + (num_trucks * charger_kw)", load.get("new_theoretical_peak_kw", 0.0), "kW"),
-        ("Avg load (new)", "existing_peak + (daily_energy_kWh / charging_window_h)", load.get("new_avg_load_kw", 0.0), "kW"),
+        ("Diesel cost baseline", "annual_km * L/100km * diesel_price", float(dv.get("diesel_cost_baseline_eur", 0.0)), "€/year"),
+        ("Baseline toll cost", "annual_km * tolled_share * toll_rate", float(dv.get("baseline_toll_cost_eur", 0.0)), "€/year"),
+        ("Total savings incl. toll", "diesel_cost - ev_cost + toll_savings", float(dv.get("total_savings_incl_toll_eur", 0.0)), "€/year"),
+        ("Theoretical peak (new)", "site_peak + (num_trucks * charger_kw)", float(load.get("new_theoretical_peak_kw", 0.0)), "kW"),
+        ("Available kW at peak", "site_capacity - site_peak_in_window", float(cap.get("available_kw_at_peak", np.nan)), "kW"),
+        ("Max trucks (energy-based)", "(avail_kw*window_h)/kWh_per_truck_day", float(cap.get("max_trucks_energy_based", np.nan)), "trucks"),
         ("Cost per km (EV)", "annual_ev_cost / annual_km", cost_per_km, "€/km"),
         ("CO₂ per km (EV)", "annual_ev_co2 / annual_km", ev_co2_per_km, "kg/km"),
         ("CO₂ per km (diesel)", "diesel_co2 / annual_km", diesel_co2_per_km, "kg/km"),
     ]
-    df = pd.DataFrame(rows, columns=["Metric", "Formula", "Value", "Unit"])
-    return df
+    return pd.DataFrame(rows, columns=["Metric", "Formula", "Value", "Unit"])
 
 
 def build_hourly_df(res: dict) -> pd.DataFrame:
-    inp = res["inputs"]
-    prof = res["charging_profile"]
-    ec = res["energy_cost"]
+    """
+    Hourly view for charts.
 
-    flags = prof["flags"]
-    shares = prof["shares"]
+    If a load profile was uploaded, we use its hourly_max_kw as baseline (conservative).
+    Otherwise we fall back to a flat baseline = existing_site_peak_kw.
+    """
+    inp = res["inputs"]
+    prof = res.get("profile", {})
+    ec = res["energy_cost"]
+    charging = res["charging_profile"]
+
+    flags = charging["flags"]
+    shares = charging["shares"]
 
     total_daily_kwh = float(ec["total_daily_energy_mwh"]) * 1000.0
     clock_hours = int(sum(flags)) if sum(flags) > 0 else 24
     power_if_spread_kw = (total_daily_kwh / clock_hours) if clock_hours > 0 else 0.0
 
-    # effektive Ladeleistung (aus charging_window_hours)
+    # Effective average charging power (to deliver energy within effective charging time)
     eff_power_kw = (total_daily_kwh / float(inp["charging_window_hours"])) if inp["charging_window_hours"] > 0 else 0.0
 
     ev_kw = [power_if_spread_kw if flags[h] else 0.0 for h in range(24)]
     ev_kwh = [ev_kw[h] for h in range(24)]  # 1h bins
-    site_load_kw = [float(inp["existing_site_peak_kw"]) + ev_kw[h] for h in range(24)]
+
+    # Baseline load
+    if prof.get("hourly_max_kw"):
+        base = [float(x) for x in prof["hourly_max_kw"]]
+        base_label = "Baseline (from upload)"
+    else:
+        base = [float(inp["existing_site_peak_kw"])] * 24
+        base_label = "Baseline (manual)"
+
+    site_load_kw_spread = [base[h] + ev_kw[h] for h in range(24)]
 
     df = pd.DataFrame({
         "hour": list(range(24)),
         "in_window": [bool(f) for f in flags],
         "share": shares,
-        "tou_eur_per_kwh": prof["tou_price_eur_per_kwh"],
-        "grid_co2_g_per_kwh": prof["grid_co2_g_per_kwh"],
+        "price_eur_per_kwh": charging["tou_price_eur_per_kwh"],  # may be spot avg if uploaded
+        "grid_co2_g_per_kwh": charging["grid_co2_g_per_kwh"],
         "ev_power_kw_spread": ev_kw,
         "ev_energy_kwh": ev_kwh,
-        "site_load_kw_spread": site_load_kw,
+        "site_load_baseline_kw": base,
+        "site_load_kw_spread": site_load_kw_spread,
         "eff_power_kw_required": [eff_power_kw] * 24,
+        "baseline_label": [base_label] * 24,
     })
     return df
 
 
-def fig_price_co2(df: pd.DataFrame):
+# =========================================================
+# Charts
+# =========================================================
+def fig_price_co2(df: pd.DataFrame, label_price: str):
     fig, ax1 = plt.subplots(figsize=(10, 4))
     ax2 = ax1.twinx()
 
-    ax1.plot(df["hour"], df["tou_eur_per_kwh"], marker="o")
+    ax1.plot(df["hour"], df["price_eur_per_kwh"], marker="o")
     ax2.plot(df["hour"], df["grid_co2_g_per_kwh"], marker="s")
 
     ax1.set_xlabel("Hour")
-    ax1.set_ylabel("TOU price (€/kWh)")
+    ax1.set_ylabel(label_price)
     ax2.set_ylabel("Grid CO₂ (g/kWh)")
 
     # Window shading
     inw = df["in_window"].to_numpy()
     if inw.any():
-        # contiguous blocks
-        hours = df["hour"].to_numpy()
         for h in range(24):
             if inw[h]:
                 ax1.axvspan(h - 0.5, h + 0.5, alpha=0.08)
@@ -1126,8 +1486,9 @@ def fig_price_co2(df: pd.DataFrame):
 
 def fig_load(df: pd.DataFrame, capacity_kva: float, theoretical_peak_kw: float):
     fig, ax = plt.subplots(figsize=(10, 4))
-    ax.plot(df["hour"], df["site_load_kw_spread"], marker="o", label="Site load (spread across window)")
-    ax.plot(df["hour"], df["eff_power_kw_required"] + df["site_load_kw_spread"]*0 + 0, alpha=0.0)  # keep axes stable
+
+    ax.plot(df["hour"], df["site_load_baseline_kw"], marker="o", label="Site baseline load")
+    ax.plot(df["hour"], df["site_load_kw_spread"], marker="o", label="Site load + EV (spread in window)")
 
     if capacity_kva and capacity_kva > 0:
         ax.axhline(capacity_kva, linestyle="--", label="Site capacity limit (kVA≈kW)")
@@ -1167,33 +1528,101 @@ def fig_waterfall(res: dict):
     return fig
 
 
+def fig_finance_bars(res: dict):
+    """Two simple bar charts: (1) Diesel vs EV costs, (2) Toll effect. Order matches explanation text."""
+    dv = res["diesel_vs_ev"]
+    diesel_cost = float(dv.get("diesel_cost_baseline_eur", 0.0))
+    ev_cost = float(dv.get("ev_cost_eur", 0.0))
+    total_savings = float(dv.get("total_savings_incl_toll_eur", 0.0))
+    toll_base = float(dv.get("baseline_toll_cost_eur", 0.0))
+    toll_sav = float(dv.get("toll_savings_eur", 0.0))
+    toll_ev = toll_base - toll_sav
+
+    # Chart 1
+    fig1, ax1 = plt.subplots(figsize=(7.5, 4))
+    ax1.bar(["Diesel (baseline)", "EV (electricity)"], [diesel_cost, ev_cost])
+    ax1.axhline(0, linestyle="--", alpha=0.3)
+    ax1.set_ylabel("€/year")
+    ax1.set_title("Annual energy cost comparison")
+    ax1.grid(True, axis="y", alpha=0.2)
+    fig1.tight_layout()
+
+    # Chart 2 (swapped into second position to align with narrative)
+    fig2, ax2 = plt.subplots(figsize=(7.5, 4))
+    ax2.bar(["Toll (diesel)", "Toll (EV)"], [toll_base, toll_ev])
+    ax2.set_ylabel("€/year")
+    ax2.set_title("Toll effect")
+    ax2.grid(True, axis="y", alpha=0.2)
+    fig2.tight_layout()
+
+    return fig1, fig2
+
 def fig_pareto_shifted_windows(res: dict):
     """Trade-off: shift the same window length across the day, plot EV cost vs EV CO2."""
-    base_inp = res["inputs"].copy()
-    flags, _ = compute_flags_and_shares(base_inp["start_hour"], base_inp["end_hour"])
-    win_len = int(sum(flags)) if sum(flags) > 0 else 24
+    try:
+        # --- keep original window length ---
+        start0 = int(res["inputs"].get("start_hour", 0)) % 24
+        end0 = int(res["inputs"].get("end_hour", 0)) % 24
+        flags0, _ = compute_flags_and_shares(start0, end0)
+        win_len = int(sum(flags0)) if sum(flags0) > 0 else 24
 
-    points = []
-    for start in range(24):
-        end = (start + win_len) % 24
-        r = run_model(**{**base_inp, "start_hour": start, "end_hour": end})
-        points.append({
-            "start": start, "end": end,
-            "cost": float(r["energy_cost"]["annual_cost_eur"]),
-            "co2": float(r["co2"]["annual_ev_co2_kg"]),
-        })
+        # --- base kwargs WITHOUT start/end (fix for TypeError) ---
+        base_inp = res["inputs"].copy()
+        base_inp.pop("start_hour", None)
+        base_inp.pop("end_hour", None)
 
-    df = pd.DataFrame(points)
-    fig, ax = plt.subplots(figsize=(8, 5))
-    ax.scatter(df["cost"], df["co2"])
-    for _, row in df.iterrows():
-        ax.annotate(f'{int(row["start"]):02d}', (row["cost"], row["co2"]), fontsize=8)
+        # --- price curve: if you uploaded spot prices, this is already overridden in results ---
+        price_curve = res.get("charging_profile", {}).get("tou_price_eur_per_kwh") or TOU_PRICE_EUR_PER_KWH
+        if not isinstance(price_curve, (list, tuple)) or len(price_curve) != 24:
+            price_curve = TOU_PRICE_EUR_PER_KWH
 
-    ax.set_xlabel("EV cost (€/year)")
-    ax.set_ylabel("EV CO₂ (kg/year)")
-    ax.grid(True, alpha=0.2)
-    fig.tight_layout()
-    return fig
+        curve_avg = float(sum(float(x) for x in price_curve)) / 24.0
+
+        points = []
+        for start in range(24):
+            end = (start + win_len) % 24
+
+            # compute window avg for THIS shifted window (important for meaningful Pareto!)
+            _, shares = compute_flags_and_shares(start, end)
+            window_avg = float(sum(float(price_curve[h]) * shares[h] for h in range(24)))
+
+            r = run_model(
+                **base_inp,
+                start_hour=start,
+                end_hour=end,
+                # feed per-window spot stats (even if fixed mode: harmless)
+                spot_curve_avg_eur_per_kwh=curve_avg,
+                spot_window_avg_eur_per_kwh=window_avg,
+            )
+
+            points.append({
+                "start": start,
+                "end": end,
+                "cost": float(r["energy_cost"]["annual_cost_eur"]),
+                "co2": float(r["co2"]["annual_ev_co2_kg"]),
+            })
+
+        df = pd.DataFrame(points)
+
+        fig, ax = plt.subplots(figsize=(8, 5))
+        ax.scatter(df["cost"], df["co2"])
+        for _, row in df.iterrows():
+            ax.annotate(f'{int(row["start"]):02d}', (row["cost"], row["co2"]), fontsize=8)
+
+        ax.set_xlabel("EV cost (€/year)")
+        ax.set_ylabel("EV CO₂ (kg/year)")
+        ax.grid(True, alpha=0.2)
+        fig.tight_layout()
+        return fig
+
+    except Exception as e:
+        # never crash the whole report page because of this chart
+        fig, ax = plt.subplots(figsize=(8, 2.5))
+        ax.axis("off")
+        ax.text(0.01, 0.6, "Pareto chart unavailable.", fontsize=12)
+        ax.text(0.01, 0.25, f"Reason: {e}", fontsize=9)
+        fig.tight_layout()
+        return fig
 
 
 def fig_to_png_bytes(fig) -> bytes:
@@ -1203,14 +1632,11 @@ def fig_to_png_bytes(fig) -> bytes:
     return buf.getvalue()
 
 
-
 # =========================================================
-# Page config + styling (darker background)
+# Page config + styling (kept)
 # =========================================================
 st.set_page_config(page_title="FleetMate — Guided Intake", layout="wide")
-
 require_login()
-
 
 st.markdown("""
 <style>
@@ -1305,84 +1731,12 @@ label, .stMarkdown, .stCaption {color: var(--txt) !important;}
 
 div[role="radiogroup"]{gap: 0.55rem;}
 
-/* ===== Dark-mode fixes for dropdowns / menus / sliders / metrics ===== */
-div[data-baseweb="select"] > div{
-  background: rgba(255,255,255,0.06) !important;
-  border-color: rgba(255,255,255,0.16) !important;
-}
-div[data-baseweb="select"] *{ color: #000 !important; }
-div[data-baseweb="select"] svg{ fill: var(--txt) !important; }
-
-div[data-baseweb="popover"] > div{
-  background: rgba(8,10,18,0.98) !important;
-  border: 1px solid rgba(255,255,255,0.16) !important;
-  box-shadow: 0 24px 72px rgba(0,0,0,0.55) !important;
-}
-ul[role="listbox"]{ background: transparent !important; }
-li[role="option"]{ color: #000 !important; }
-li[role="option"]:hover{ background: rgba(255,255,255,0.08) !important; }
-
-div[data-baseweb="slider"] *{ color: var(--txt) !important; }
 div[data-testid="stMetric"] *{ color: var(--txt) !important; }
 div[data-testid="stMetricLabel"]{ color: var(--muted) !important; }
-div[data-testid="stMetricValue"]{ color: var(--txt) !important; }
 div[data-testid="stMetricDelta"]{ color: var(--muted) !important; }
 
-/* Expanders */
 details summary, details summary *{ color: var(--txt) !important; }
 
-
-/* Inputs: light surface + dark text (readable on dark cards) */
-div[data-baseweb="input"] input,
-div[data-baseweb="textarea"] textarea,
-div[data-baseweb="select"] > div {
-  background: rgba(255,255,255,0.92) !important;
-  color: rgba(8,10,16,0.96) !important;
-}
-div[data-baseweb="input"] input::placeholder,
-div[data-baseweb="textarea"] textarea::placeholder {
-  color: rgba(8,10,16,0.45) !important;
-}
-
-/* Selectbox option list (dropdown) */
-div[data-baseweb="select"] span,
-div[data-baseweb="select"] input{
-  color: rgba(8,10,16,0.96) !important;
-}
-div[data-baseweb="popover"] ul[role="listbox"]{
-  background: rgba(255,255,255,0.98) !important;
-  border: 1px solid rgba(10,10,20,0.16) !important;
-}
-div[data-baseweb="popover"] ul[role="listbox"] *{
-  color: rgba(8,10,16,0.96) !important;
-}
-
-/* Make widget labels on dark cards readable */
-div[data-testid="stContainer"] label,
-div[data-testid="stContainer"] p,
-div[data-testid="stContainer"] span {
-  color: rgba(245,247,255,0.92);
-}
-
-/* Flow switch (questionnaire/report) readable */
-div[data-testid="stRadio"][data-baseweb="radio-group"] label,
-div[data-testid="stRadio"] label {
-  color: rgba(245,247,255,0.92) !important;
-}
-
-.st-bc, .stBaseButton, .stBaseButton-secondary{
-color: #fff !important;
-}
-            
-.stAppHeader {
-background-color: transparent !important;
-color: #fff !important;
-}
-            
-.st-emotion-cache-18kf3ut {
-margin-top: 15px;
-}
-            
 .stDownloadButton > button{
   border-radius: 999px !important;
   padding: 0.62rem 1.0rem !important;
@@ -1392,14 +1746,9 @@ margin-top: 15px;
   box-shadow: var(--shadow2) !important;
   backdrop-filter: blur(12px) !important;
 }
-.stDownloadButton > button:hover{
-  transform: translateY(-1px);
-  box-shadow: 0 22px 58px rgba(0,0,0,0.45) !important;
-}
-.stDownloadButton > button:active{transform: translateY(0px);}
-
 </style>
 """, unsafe_allow_html=True)
+
 
 # =========================================================
 # Wizard steps
@@ -1408,11 +1757,11 @@ STEPS = [
     {"id": "fleet", "title_en": "Fleet & Usage", "title_de": "Flotte & Nutzung",
      "sub_en": "How much charging your operation needs.", "sub_de": "Wie viel Laden dein Betrieb braucht."},
     {"id": "battery", "title_en": "Battery & Consumption", "title_de": "Batterie & Verbrauch",
-     "sub_en": "How much energy each charging event represents.", "sub_de": "Wie viel Energie ein Lade-Event bedeutet."},
-    {"id": "electricity", "title_en": "Electricity & Overnight Charging", "title_de": "Strom & Übernacht-Laden",
-     "sub_en": "Price + typical charging hours.", "sub_de": "Preis + typische Ladezeiten."},
-    {"id": "site", "title_en": "Site Capacity & Chargers", "title_de": "Standortkapazität & Lader",
-     "sub_en": "Connection limit + charger power.", "sub_de": "Anschlusslimit + Ladeleistung."},
+     "sub_en": "Derive energy need from km/day (no SoC inputs).", "sub_de": "Energiebedarf aus km/Tag ableiten (keine SoC-Inputs)."},
+    {"id": "electricity", "title_en": "Electricity & Charging Window", "title_de": "Strom & Ladefenster",
+     "sub_en": "Fixed vs dynamic price + typical charging hours.", "sub_de": "Fix vs dynamisch + typische Ladezeiten."},
+    {"id": "site", "title_en": "Site Capacity & Load Profile", "title_de": "Standortkapazität & Lastprofil",
+     "sub_en": "Upload load profile + check headroom during your charging window.", "sub_de": "Lastprofil hochladen + Headroom im Ladefenster prüfen."},
     {"id": "diesel", "title_en": "Diesel Baseline & Toll", "title_de": "Diesel-Baseline & Maut",
      "sub_en": "So the business case compares fairly.", "sub_de": "Damit der Vergleich fair ist."},
 ]
@@ -1439,9 +1788,9 @@ def current_step():
 ensure_defaults()
 apply_pending_flow()
 ensure_assistant_greeting()
+
+# Always recalc early (uses upload cache if available)
 recalc_from_inputs()
-
-
 
 top_l, top_r = st.columns([0.70, 0.30], vertical_alignment="center")
 with top_l:
@@ -1465,7 +1814,6 @@ with top_r:
         st.session_state["report_meta"] = None
         st.session_state["report_pdf_bytes"] = None
         st.rerun()
-        st.session_state["charts_md"] = None
 
 left, right = st.columns([0.62, 0.38], gap="large")
 
@@ -1497,6 +1845,15 @@ with right:
                 unsafe_allow_html=True
             )
 
+            # New: capacity headroom from load profile window
+            cap = res.get("capacity_analysis", {})
+            if cap:
+                st.markdown(
+                    f"<span class='gs-pill'>🏭 Peak im Ladefenster: {fmt_num(cap.get('site_peak_kw_in_window'))} kW</span> "
+                    f"&nbsp; <span class='gs-pill'>🧩 Headroom: {fmt_num(cap.get('available_kw_at_peak'))} kW</span>",
+                    unsafe_allow_html=True
+                )
+
     with st.container(border=True):
         st.markdown(f"### 💬 {t('assistant_title')}")
         st.markdown(f"<div class='small-note'>{t('assistant_hint')}</div>", unsafe_allow_html=True)
@@ -1526,9 +1883,8 @@ with left:
             label_visibility="collapsed",
             key="flow_switch",
         )
-        new_flow = mode
-        if new_flow != st.session_state.get("flow"):
-            st.session_state["flow"] = new_flow
+        if mode != st.session_state.get("flow"):
+            st.session_state["flow"] = mode
             st.rerun()
 
     with mode_r:
@@ -1554,22 +1910,18 @@ with left:
                     sid, "num_trucks",
                     "How many trucks charge per day?" if lang == "EN" else "Wie viele LKW laden pro Tag?",
                     min_value=1, max_value=10000, step=1,
-                    help=("Total trucks that typically need charging on a normal day." if lang == "EN"
-                          else "Wie viele Fahrzeuge typischerweise an einem normalen Tag laden müssen.")
                 )
                 bind_number(
                     sid, "operating_days",
                     "Operating days per year" if lang == "EN" else "Betriebstage pro Jahr",
                     min_value=1, max_value=366, step=1,
-                    help=("How many days per year the fleet operates (used to annualise costs and CO₂)." if lang == "EN"
-                          else "Wie viele Tage pro Jahr die Flotte fährt (für Jahreswerte von Kosten/CO₂).")
                 )
                 bind_number(
                     sid, "events_per_truck",
                     "Charging events per truck per day" if lang == "EN" else "Lade-Events pro LKW pro Tag",
-                    min_value=0.0, max_value=10.0, step=0.25,
-                    help=("Example: 1.0 = once per day; 1.5 = some days twice." if lang == "EN"
-                          else "Beispiel: 1,0 = 1× pro Tag; 1,5 = an manchen Tagen 2×.")
+                    min_value=0.25, max_value=10.0, step=0.25,
+                    help=("Example: 1.0 = once per day; 2.0 = two separate charging events." if lang == "EN"
+                          else "Beispiel: 1,0 = 1× pro Tag; 2,0 = 2 getrennte Lade-Events.")
                 )
                 st.markdown(
                     "<div class='small-note'>If trucks sometimes charge twice per day, set this above 1.0.</div>" if lang == "EN"
@@ -1581,27 +1933,27 @@ with left:
                 PROFILES = {
                     "city": {
                         "label_en": "City / Last‑Mile", "label_de": "City / Last‑Mile",
-                        "battery_kwh": 220.0, "ev_consumption": 1.0,
-                        "desc_en": "Short routes, lots of stops. Typical battery: 150–300 kWh. Typical consumption: 0.7–1.3 kWh/km.",
-                        "desc_de": "Kurze Strecken, viele Stopps. Typische Batterie: 150–300 kWh. Typischer Verbrauch: 0,7–1,3 kWh/km.",
+                        "battery_kwh": 220.0, "ev_consumption": 0.9,
+                        "desc_en": "Short routes, lots of stops. Typical consumption: 0.7–1.1 kWh/km.",
+                        "desc_de": "Kurze Strecken, viele Stopps. Typischer Verbrauch: 0,7–1,1 kWh/km.",
                     },
                     "regional": {
                         "label_en": "Regional Distribution", "label_de": "Regionale Distribution",
-                        "battery_kwh": 350.0, "ev_consumption": 1.4,
-                        "desc_en": "Mixed urban + regional. Typical battery: 250–450 kWh. Typical consumption: 1.0–1.8 kWh/km.",
-                        "desc_de": "Mix aus Stadt + Region. Typische Batterie: 250–450 kWh. Typischer Verbrauch: 1,0–1,8 kWh/km.",
+                        "battery_kwh": 350.0, "ev_consumption": 1.0,
+                        "desc_en": "Mixed urban + regional. Typical consumption: 0.8–1.2 kWh/km.",
+                        "desc_de": "Mix aus Stadt + Region. Typischer Verbrauch: 0,8–1,2 kWh/km.",
                     },
                     "heavy_regional": {
                         "label_en": "Heavy Regional (mixed)", "label_de": "Schwer regional (gemischt)",
-                        "battery_kwh": 500.0, "ev_consumption": 1.8,
-                        "desc_en": "Heavier loads, more motorway. Typical battery: 350–600 kWh. Typical consumption: 1.3–2.2 kWh/km.",
-                        "desc_de": "Schwerere Lasten, mehr Autobahn. Typische Batterie: 350–600 kWh. Typischer Verbrauch: 1,3–2,2 kWh/km.",
+                        "battery_kwh": 500.0, "ev_consumption": 1.1,
+                        "desc_en": "Heavier loads. Typical consumption: ~1.0–1.3 kWh/km.",
+                        "desc_de": "Schwerere Lasten. Typischer Verbrauch: ~1,0–1,3 kWh/km.",
                     },
                     "long_haul": {
                         "label_en": "Long‑haul / 40t", "label_de": "Langstrecke / 40t",
-                        "battery_kwh": 650.0, "ev_consumption": 2.2,
-                        "desc_en": "High speed + high mass. Typical battery: 500–900 kWh. Typical consumption: 1.6–2.8 kWh/km.",
-                        "desc_de": "Hohe Geschwindigkeit + hohe Masse. Typische Batterie: 500–900 kWh. Typischer Verbrauch: 1,6–2,8 kWh/km.",
+                        "battery_kwh": 650.0, "ev_consumption": 1.2,
+                        "desc_en": "Long-haul baseline (kept conservative). If you have measured data, fine-tune.",
+                        "desc_de": "Langstrecke Basis (konservativ). Mit Messdaten bitte feinjustieren.",
                     },
                 }
 
@@ -1610,8 +1962,6 @@ with left:
                     "Vehicle profile (recommended defaults)" if lang == "EN" else "Fahrprofil (empfohlene Defaults)",
                     options=list(PROFILES.keys()),
                     format_func=lambda k: PROFILES[k]["label_en"] if lang == "EN" else PROFILES[k]["label_de"],
-                    help=("Pick what fits best — you can still adjust the numbers below." if lang == "EN"
-                          else "Wähle das passendste Profil — du kannst die Werte unten trotzdem anpassen.")
                 )
                 prof = PROFILES.get(get_inp("vehicle_profile"), PROFILES["heavy_regional"])
                 st.info(prof["desc_en"] if lang == "EN" else prof["desc_de"])
@@ -1627,8 +1977,9 @@ with left:
                 with c_note:
                     st.markdown(
                         "<div class='small-note'>"
-                        + ("Pragmatic real‑world defaults. Fine‑tune if you have fleet data." if lang == "EN"
-                           else "Pragmatische Real‑World Defaults. Wenn du Flottendaten hast: feinjustieren.")
+                        + ("Defaults are designed to be realistic. If you have fleet telematics, use measured values."
+                           if lang == "EN"
+                           else "Defaults sind realistisch angesetzt. Wenn du Flottendaten hast: gemessene Werte verwenden.")
                         + "</div>",
                         unsafe_allow_html=True
                     )
@@ -1640,43 +1991,75 @@ with left:
                     "Average battery capacity (kWh)" if lang == "EN" else "Durchschnittliche Batteriekapazität (kWh)",
                     min_value=1.0, max_value=2000.0, step=10.0,
                 )
-                bind_slider(
-                    sid, "start_soc",
-                    "Typical return SoC (how empty?)" if lang == "EN" else "Typischer Rückkehr-SoC (wie leer?)",
-                    0.0, 1.0, 0.05,
-                    help=("Default 20%." if lang == "EN" else "Default 20%.")
-                )
-                bind_slider(
-                    sid, "target_soc",
-                    "Target SoC (how full?)" if lang == "EN" else "Ziel-SoC (wie voll?)",
-                    0.0, 1.0, 0.05,
-                    help=("Default 100% (simple baseline)." if lang == "EN" else "Default 100% (einfache Basis).")
-                )
                 bind_number(
                     sid, "ev_consumption",
                     "EV consumption (kWh per km)" if lang == "EN" else "EV-Verbrauch (kWh pro km)",
-                    min_value=0.1, max_value=10.0, step=0.1,
+                    min_value=0.5, max_value=3.0, step=0.05,
+                    help=("Typical range: 0.8–1.2 kWh/km for many use cases." if lang == "EN"
+                          else "Typischer Bereich: 0,8–1,2 kWh/km für viele Anwendungen.")
                 )
-                if float(get_inp("start_soc")) >= float(get_inp("target_soc")):
-                    st.warning(
-                        "Start SoC is not below Target SoC — that implies no charging energy." if lang == "EN"
-                        else "Start-SoC ist nicht unter dem Ziel-SoC — das bedeutet praktisch keine Ladeenergie."
-                    )
+                bind_number(
+                    sid, "km_per_truck_per_day",
+                    "Average km driven per truck per day" if lang == "EN" else "Ø km pro LKW und Tag",
+                    min_value=0.0, max_value=2000.0, step=10.0,
+                    help=("This replaces SoC inputs. We derive the SoC drop from km/day, consumption, and battery size." if lang == "EN"
+                          else "Ersetzt SoC-Inputs. Wir leiten den SoC-Abfall aus km/Tag, Verbrauch und Batterie ab.")
+                )
+
+                # Show derived SoC / energy clearly to the customer
+                d = derive_soc_from_km(st.session_state["inputs"])
+                st.markdown(
+                    ("**Derived from your km/day:**" if lang == "EN" else "**Aus km/Tag abgeleitet:**")
+                )
+                c1, c2, c3 = st.columns(3)
+                with c1:
+                    st.metric("Energy / truck / day" if lang == "EN" else "Energie / LKW / Tag",
+                              f"{d['daily_energy_kwh']:,.0f} kWh")
+                with c2:
+                    st.metric("Energy / event" if lang == "EN" else "Energie / Event",
+                              f"{d['energy_per_event_kwh']:,.0f} kWh")
+                with c3:
+                    st.metric("SoC drop / event" if lang == "EN" else "SoC-Abfall / Event",
+                              f"{d['soc_diff']*100:,.0f}%")
+
+                if d.get("warning"):
+                    st.warning(d["warning"])
 
             elif sid == "electricity":
-                bind_number(
-                    sid, "avg_elec_price_mwh",
-                    "Average electricity price (€/MWh)" if lang == "EN" else "Ø Strompreis (€/MWh)",
-                    min_value=0.0, max_value=2000.0, step=10.0,
-                    help=("Default 200 €/MWh (= 0.20 €/kWh)." if lang == "EN"
-                          else "Default 200 €/MWh (= 0,20 €/kWh).")
+                # Price mode (fixed vs dynamic) — replaces dynamic_share input
+                bind_select(
+                    sid, "price_mode",
+                    "Electricity price type" if lang == "EN" else "Strompreis-Typ",
+                    options=["fixed", "dynamic"],
+                    format_func=lambda v: ("Fixed contract" if lang == "EN" else "Fixpreis-Vertrag") if v == "fixed"
+                    else ("Dynamic (spot price)" if lang == "EN" else "Dynamisch (Spotpreis)"),
+                    help=("Dynamic uses historic spot prices from the uploaded profile (column with prices)."
+                          if lang == "EN" else
+                          "Dynamisch nutzt historische Spotpreise aus dem hochgeladenen Profil (Preisspalte).")
                 )
-                bind_slider(
-                    sid, "dynamic_share",
-                    "Dynamic price share (0–1)" if lang == "EN" else "Dynamischer Preisanteil (0–1)",
-                    0.0, 1.0, 0.05,
-                    help=("Default 30%." if lang == "EN" else "Default 30%.")
-                )
+
+                if get_inp("price_mode") == "fixed":
+                    bind_number(
+                        sid, "fixed_elec_price_mwh",
+                        "Fixed electricity price (€/MWh)" if lang == "EN" else "Fixer Strompreis (€/MWh)",
+                        min_value=0.0, max_value=2000.0, step=10.0,
+                        help=("Example: 200 €/MWh = 0.20 €/kWh" if lang == "EN" else "Beispiel: 200 €/MWh = 0,20 €/kWh")
+                    )
+                else:
+                    st.info(
+                        ("Dynamic mode: Upload a load profile CSV that also contains spot prices "
+                         "(e.g., a 'da_price' column). If no price column is present, we fall back to your fixed price.")
+                        if lang == "EN" else
+                        ("Dynamisch: Lade ein Lastprofil-CSV hoch, das auch Spotpreise enthält "
+                         "(z. B. Spalte 'da_price'). Fehlt die Preisspalte, wird dein Fixpreis als Fallback genutzt.")
+                    )
+                    bind_number(
+                        sid, "fixed_elec_price_mwh",
+                        "Fallback price if no spot data (€/MWh)" if lang == "EN" else "Fallback-Preis falls keine Spotdaten (€/MWh)",
+                        min_value=0.0, max_value=2000.0, step=10.0,
+                    )
+
+                gs_hr()
 
                 c1, c2 = st.columns(2)
                 with c1:
@@ -1684,60 +2067,189 @@ with left:
                         sid, "start_hour",
                         "Charging start hour" if lang == "EN" else "Ladebeginn (Stunde)",
                         0, 23, 1,
-                        help=("Default 22:00 (overnight)." if lang == "EN" else "Default 22:00 (Übernacht).")
                     )
                 with c2:
                     bind_slider(
                         sid, "end_hour",
                         "Charging end hour" if lang == "EN" else "Ladeende (Stunde)",
                         0, 23, 1,
-                        help=("Default 08:00 (overnight)." if lang == "EN" else "Default 08:00 (Übernacht).")
                     )
 
-                wh = window_len_hours(get_inp("start_hour"), get_inp("end_hour"))
-                st.markdown(
-                    "<div class='small-note'>"
-                    + (f"Your time window spans <b>{wh} hours</b>. Now set how many hours you are actually charging (effective charging time)."
-                       if lang == "EN"
-                       else f"Dein Zeitfenster umfasst <b>{wh} Stunden</b>. Jetzt: Wie viele Stunden davon wird wirklich effektiv geladen (effektive Ladezeit).")
-                    + "</div>",
-                    unsafe_allow_html=True
-                )
 
-                cW1, cW2 = st.columns([0.70, 0.30])
-                with cW1:
-                    bind_number(
-                        sid, "charging_window_hours",
-                        "Effective charging time (hours)" if lang == "EN" else "Effektive Ladezeit (Stunden)",
-                        min_value=0.5, max_value=24.0, step=0.5,
-                        help=("Usually ≤ window length. Example: plugged in 22–08 but only charges 6h → enter 6."
-                              if lang == "EN"
-                              else "Meist ≤ Fensterlänge. Beispiel: 22–08 eingesteckt, aber nur 6h aktiv → 6 eintragen.")
-                    )
-                with cW2:
-                    if st.button(t("apply_window"), use_container_width=True, key="apply_full_window"):
-                        set_inp("charging_window_hours", float(wh))
-                        st.session_state.pop(wkey("electricity", "charging_window_hours"), None)  # wichtig!
-                        st.rerun()
 
             elif sid == "site":
+                # ---- Upload section ----
+                st.markdown("**Lastprofil Upload (CSV)**" if lang == "DE" else "**Load profile upload (CSV)**")
+                st.caption(
+                    ("Only the hours inside your charging window matter. We'll look at the peak site load in that window "
+                     "to compute how much kW are still available for truck charging.")
+                    if lang == "EN" else
+                    ("Wichtig: Für die Auswertung zählt nur dein Ladefenster. Wir nehmen den Peak der Standortlast im Ladefenster "
+                     "und berechnen daraus, wie viel kW noch für das Laden übrig sind.")
+                )
+
+                upload = st.file_uploader(
+                    "Upload CSV (timestamp + site consumption kW, optional price column)" if lang == "EN"
+                    else "CSV hochladen (Timestamp + Standortverbrauch kW, optional Preisspalte)",
+                    type=["csv"],
+                    key="load_profile_uploader",
+                    help=("Example columns: timestamp, consumption_kW, da_price" if lang == "EN"
+                          else "Beispiel-Spalten: timestamp, consumption_kW, da_price")
+                )
+
+                if upload is not None:
+                    raw = upload.getvalue()
+                    digest = hashlib.md5(raw).hexdigest()
+                    cache = st.session_state["profile_cache"]
+
+                    if cache.get("digest") != digest:
+                        df_raw = parse_uploaded_csv(upload)
+                        cache.update({"digest": digest, "df": df_raw, "metrics": {}, "meta": {}})
+                        # Try auto-detect columns
+                        if df_raw is not None and not df_raw.empty:
+                            cache["timestamp_col"] = _guess_timestamp_col(df_raw)
+                            cache["consumption_col"] = _guess_consumption_col(df_raw)
+                            cache["price_col"] = _guess_price_col(df_raw)
+
+                    df_raw = cache.get("df")
+                    if df_raw is None or df_raw.empty:
+                        st.error("CSV konnte nicht gelesen werden." if lang == "DE" else "Could not read CSV.")
+                    else:
+                        # Column selectors (customer-friendly, minimal)
+                        cols = list(df_raw.columns)
+
+                        cA, cB, cC = st.columns(3)
+                        with cA:
+                            ts_col = st.selectbox(
+                                "Timestamp column" if lang == "EN" else "Timestamp-Spalte",
+                                options=cols,
+                                index=cols.index(cache["timestamp_col"]) if cache.get("timestamp_col") in cols else 0,
+                                key="ts_col_select",
+                            )
+                        with cB:
+                            cons_col = st.selectbox(
+                                "Consumption column (kW)" if lang == "EN" else "Verbrauchsspalte (kW)",
+                                options=cols,
+                                index=cols.index(cache["consumption_col"]) if cache.get("consumption_col") in cols else 0,
+                                key="cons_col_select",
+                            )
+                        with cC:
+                            price_opts = ["(none)"] + cols
+                            default_price = cache.get("price_col") if cache.get("price_col") in cols else "(none)"
+                            price_col = st.selectbox(
+                                "Price column (optional)" if lang == "EN" else "Preisspalte (optional)",
+                                options=price_opts,
+                                index=price_opts.index(default_price) if default_price in price_opts else 0,
+                                key="price_col_select",
+                            )
+                            price_col = None if price_col == "(none)" else price_col
+
+                        cache["timestamp_col"] = ts_col
+                        cache["consumption_col"] = cons_col
+                        cache["price_col"] = price_col
+
+                        # Compute metrics using current charging window
+                        start_h = int(get_inp("start_hour")) % 24
+                        end_h = int(get_inp("end_hour")) % 24
+                        try:
+                            metrics = compute_profile_metrics(df_raw, ts_col, cons_col, price_col, start_h, end_h)
+                            cache["metrics"] = metrics
+                        except Exception:
+                            cache["metrics"] = {}
+                            st.warning("Profil konnte nicht vollständig ausgewertet werden." if lang == "DE"
+                                       else "Could not fully analyse profile.")
+
+                        # Preview
+                        with st.expander("Preview (first rows)", expanded=False):
+                            st.dataframe(df_raw.head(60), use_container_width=True)
+
+                        # Show window-peak and headroom instantly
+                        m = cache.get("metrics") or {}
+                        if m.get("peak_kw_in_window") is not None:
+                            cap_kva = float(get_inp("site_capacity_kva"))
+                            avail = max(0.0, cap_kva - float(m["peak_kw_in_window"]))
+                            st.markdown("**Kapazität im Ladefenster**" if lang == "DE" else "**Capacity in charging window**")
+                            c1, c2, c3 = st.columns(3)
+                            with c1:
+                                st.metric("Peak Last im Fenster" if lang == "DE" else "Peak load in window",
+                                          f"{float(m['peak_kw_in_window']):,.0f} kW")
+                            with c2:
+                                st.metric("Standort-Limit" if lang == "DE" else "Site limit",
+                                          f"{cap_kva:,.0f} kW")
+                            with c3:
+                                st.metric("Headroom (Peak)" if lang == "DE" else "Headroom (peak)",
+                                          f"{avail:,.0f} kW")
+                        else:
+                            st.info("Keine Peak-Auswertung möglich (Spalten prüfen)." if lang == "DE"
+                                    else "No peak evaluation possible (check columns).")
+
+                        # Trigger recalc with new profile
+                        st.session_state["profile_cache"] = cache
+                        recalc_from_inputs()
+                else:
+                    st.session_state["profile_cache"]["digest"] = None
+                    st.session_state["profile_cache"]["df"] = None
+                    st.session_state["profile_cache"]["metrics"] = {}
+
+                gs_hr()
+
+                # ---- Manual inputs still exist as fallback ----
                 bind_number(
-                    sid, "existing_peak_kw",
-                    "Existing site peak load (kW)" if lang == "EN" else "Bestehende Peak-Last (kW)",
+                    sid, "site_capacity_kva",
+                    "Site capacity limit (kW/kVA)" if lang == "EN" else "Standort-Limit (kW/kVA)",
                     min_value=0.0, max_value=100000.0, step=10.0,
+                    help=("Total site connection/limit. We'll compare this to the peak site load inside the charging window."
+                          if lang == "EN" else
+                          "Gesamtes Standort-Limit. Wir vergleichen das mit dem Peak im Ladefenster.")
                 )
                 bind_number(
                     sid, "charger_power_kw",
-                    "Charger power per truck (kW)" if lang == "EN" else "Ladeleistung pro LKW (kW)",
+                    "Max charger power per truck (kW)" if lang == "EN" else "Max. Ladeleistung pro LKW (kW)",
                     min_value=0.0, max_value=2000.0, step=10.0,
+                    help=("This is the maximum per-truck power. Smart charging can use a lower per-truck limit."
+                          if lang == "EN" else
+                          "Das ist die Maximalleistung pro LKW. Smart Charging kann eine geringere Leistung nutzen.")
                 )
                 bind_number(
-                    sid, "site_capacity_kva",
-                    "Site capacity limit (kVA)" if lang == "EN" else "Standort-Limit (kVA)",
+                    sid, "existing_peak_kw",
+                    "Manual site peak (kW) — used only if no profile is uploaded" if lang == "EN" else "Manueller Standort-Peak (kW) — nur ohne Profil",
                     min_value=0.0, max_value=100000.0, step=10.0,
                 )
 
-                gs_hr()
+                # Reverse calculation summary (from results)
+                recalc_from_inputs()
+                res_now = st.session_state.get("model_results", {})
+                cap = res_now.get("capacity_analysis", {}) if res_now else {}
+                if cap:
+                    gs_hr()
+                    st.markdown("### Reverse calculation (how many trucks can you charge?)" if lang == "EN"
+                                else "### Reverse Calculation (wie viele LKW kannst du laden?)")
+                    st.caption(
+                        ("We first take your **site headroom** (site limit minus peak load in your charging window). "
+                         "Then we translate that into trucks using two perspectives: energy-based vs simultaneous-at-full-power.")
+                        if lang == "EN" else
+                        ("Wir nehmen zuerst deinen **Headroom** (Standort-Limit minus Peak-Last im Ladefenster). "
+                         "Dann übersetzen wir das in LKW — einmal energie-basiert, einmal „alle gleichzeitig Vollgas“.")
+                    )
+                    a, b, c, d = st.columns(4)
+                    with a:
+                        st.metric("Headroom (kW)", f"{float(cap.get('available_kw_at_peak',0)):,.0f}")
+                    with b:
+                        st.metric("Max trucks (energy-based)", f"{int(cap.get('max_trucks_energy_based',0))}")
+                    with c:
+                        st.metric("Max trucks (simultaneous @ max kW)", f"{int(cap.get('max_trucks_simultaneous_at_full_power',0))}")
+                    with d:
+                        v = cap.get("recommended_avg_kw_per_truck")
+                        st.metric("Recommended avg kW / truck", f"{float(v):,.0f} kW" if v else "—")
+
+                    st.markdown(
+                        ("**Why lowering per-truck power can help:** If your chargers are very powerful, only a few trucks fit *simultaneously* under the site limit. "
+                         "With smart charging you cap per-truck kW and spread charging across the whole time window.")
+                        if lang == "EN" else
+                        ("**Warum geringere Ladeleistung helfen kann:** Wenn die Lader extrem stark sind, passen nur wenige LKW *gleichzeitig* unter das Standort-Limit. "
+                         "Mit Smart Charging begrenzt du kW pro LKW und verteilst das Laden über das ganze Zeitfenster.")
+                    )
+
                 with st.expander(
                     "Optional: Peak limit (energy management / battery)" if lang == "EN" else "Optional: Peak-Limit (Energiemanagement / Batterie)",
                     expanded=False
@@ -1754,8 +2266,9 @@ with left:
                     )
 
             elif sid == "diesel":
+                # Defaults: keep simple but update toll for AT based on representative ASFINAG rate
                 PRESETS = {
-                    "AT": {"diesel_price": 1.75, "toll_rate": 0.25, "tolled_share": 0.60},
+                    "AT": {"diesel_price": 1.75, "toll_rate": 0.456, "tolled_share": 0.60},
                     "DE": {"diesel_price": 1.70, "toll_rate": 0.21, "tolled_share": 0.55},
                     "EU": {"diesel_price": 1.75, "toll_rate": 0.23, "tolled_share": 0.55},
                 }
@@ -1790,7 +2303,10 @@ with left:
                 bind_number(
                     sid, "toll_rate",
                     "Toll rate (€/km)" if lang == "EN" else "Mautsatz (€/km)",
-                    min_value=0.0, max_value=5.0, step=0.01,
+                    min_value=0.0, max_value=5.0, step=0.001,
+                    help=("For AT, this default is a simplified representative ASFINAG GO-toll for 4+ axles EURO VI-ish."
+                          if lang == "EN" else
+                          "Für AT ist der Default eine vereinfachte, repräsentative ASFINAG GO-Maut (4+ Achsen, EURO VI-ähnlich).")
                 )
                 bind_slider(
                     sid, "tolled_share",
@@ -1830,6 +2346,7 @@ with left:
         else:
             tabs = st.tabs([
                 "Overview" if st.session_state["lang"] == "EN" else "Übersicht",
+                "Finance" if st.session_state["lang"] == "EN" else "Finanzen",
                 "Charts",
                 "Calculations" if st.session_state["lang"] == "EN" else "Berechnungen",
                 "What-if" if st.session_state["lang"] == "EN" else "Sensitivität",
@@ -1843,55 +2360,30 @@ with left:
                 ec = res["energy_cost"]
                 dv = res["diesel_vs_ev"]
                 load = res["load"]
+                cap = res.get("capacity_analysis", {})
+                prof = res.get("profile", {}).get("derived_soc", {})
 
                 a, b, c = st.columns(3)
                 with a: st.metric(t("kpi_savings"), fmt_eur(dv.get("total_savings_incl_toll_eur")))
                 with b: st.metric("EV cost / year" if st.session_state["lang"] == "EN" else "EV-Kosten / Jahr", fmt_eur(ec.get("annual_cost_eur")))
                 with c: st.metric(t("kpi_peak"), f"{fmt_num(load.get('new_theoretical_peak_kw'))} kW")
-                # --- Additional KPIs (from calculations) ---
-                dist = res["distance"]
-                co2 = res["co2"]
 
-                annual_km = float(dist.get("annual_km_fleet", 0.0))
-                ev_cost = float(ec.get("annual_cost_eur", 0.0))
-                ev_co2 = float(co2.get("annual_ev_co2_kg", 0.0))
-                diesel_co2 = float(dv.get("diesel_co2_baseline_kg", 0.0))
-                avg_load = float(load.get("new_avg_load_kw", 0.0))
-                shave_kw = float(load.get("required_shaving_kw", 0.0))
-                shave_kwh = float(load.get("required_battery_energy_kwh", 0.0))
-
-                cost_per_km = (ev_cost / annual_km) if annual_km > 0 else None
-                ev_co2_per_km = (ev_co2 / annual_km) if annual_km > 0 else None
-                diesel_co2_per_km = (diesel_co2 / annual_km) if annual_km > 0 else None
-
-                k1, k2, k3, k4 = st.columns(4)
-                with k1:
-                    st.metric("Jahresenergie" if st.session_state["lang"] == "DE" else "Annual energy",
-                            f"{float(ec.get('annual_energy_mwh',0.0)):,.0f} MWh")
-                with k2:
-                    st.metric("Effektiver Strompreis" if st.session_state["lang"] == "DE" else "Effective electricity price",
-                            f"{float(ec.get('effective_price_eur_per_mwh',0.0)):,.0f} €/MWh")
-                with k3:
-                    st.metric("Kosten pro km (EV)" if st.session_state["lang"] == "DE" else "Cost per km (EV)",
-                            (f"{cost_per_km:.2f} €/km" if cost_per_km is not None else "—"))
-                with k4:
-                    st.metric("Ø Last neu" if st.session_state["lang"] == "DE" else "New avg load",
-                            f"{avg_load:,.0f} kW")
-
-                k5, k6, k7, k8 = st.columns(4)
-                with k5:
-                    st.metric("CO₂ pro km (EV)" if st.session_state["lang"] == "DE" else "CO₂ per km (EV)",
-                            (f"{ev_co2_per_km:.3f} kg/km" if ev_co2_per_km is not None else "—"))
-                with k6:
-                    st.metric("CO₂ pro km (Diesel)" if st.session_state["lang"] == "DE" else "CO₂ per km (diesel)",
-                            (f"{diesel_co2_per_km:.3f} kg/km" if diesel_co2_per_km is not None else "—"))
-                with k7:
-                    st.metric("Peak-Shaving nötig" if st.session_state["lang"] == "DE" else "Peak shaving needed",
-                            (f"{shave_kw:,.0f} kW" if shave_kw > 0 else "—"))
-                with k8:
-                    st.metric("Batterie-Energie dafür" if st.session_state["lang"] == "DE" else "Battery energy for shaving",
-                            (f"{shave_kwh:,.0f} kWh" if shave_kwh > 0 else "—"))
-
+                # Capacity window KPIs (new)
+                if cap:
+                    k1, k2, k3, k4 = st.columns(4)
+                    with k1:
+                        st.metric("Peak im Ladefenster" if st.session_state["lang"] == "DE" else "Peak in window",
+                                  f"{float(cap.get('site_peak_kw_in_window',0.0)):,.0f} kW")
+                    with k2:
+                        st.metric("Headroom (Peak)" if st.session_state["lang"] == "DE" else "Headroom (peak)",
+                                  f"{float(cap.get('available_kw_at_peak',0.0)):,.0f} kW")
+                    with k3:
+                        st.metric("Max Trucks (energy)" if st.session_state["lang"] == "DE" else "Max trucks (energy)",
+                                  f"{int(cap.get('max_trucks_energy_based',0))}")
+                    with k4:
+                        v = cap.get("recommended_avg_kw_per_truck")
+                        st.metric("Empf. Ø kW/LKW" if st.session_state["lang"] == "DE" else "Rec. avg kW/truck",
+                                  f"{float(v):,.0f} kW" if v else "—")
 
                 gs_hr()
 
@@ -1901,7 +2393,7 @@ with left:
                         md = call_gemini_report(res, issues, solutions)
                         st.session_state["report_md"] = md if md else t("gemini_missing")
                         st.session_state["report_pdf_bytes"] = None
-                        st.session_state["report_meta"] = {"generated_at": __import__("datetime").datetime.utcnow().isoformat() + "Z"}
+                        st.session_state["report_meta"] = {"generated_at": datetime.datetime.utcnow().isoformat() + "Z"}
                     st.markdown(st.session_state["report_md"])
 
                 gs_hr()
@@ -1926,146 +2418,149 @@ with left:
                         st.markdown(f"**{idx}. {s.get('title','')}** — {s.get('definition','')}")
 
             with tabs[1]:
+                # Finance charts (bar charts) — ordered to match the narrative (diesel vs EV, then toll)
+                f1, f2 = fig_finance_bars(res)
+                st.pyplot(f1, use_container_width=True)
+                st.pyplot(f2, use_container_width=True)
+
+                dv = res["diesel_vs_ev"]
+                st.markdown(
+                    ("- First chart: compares **diesel baseline** vs **EV electricity**.\n"
+                     "- Second chart: shows the **toll effect** (diesel vs EV).\n"
+                     f"- Net savings incl. toll: **{float(dv.get('total_savings_incl_toll_eur',0.0)):,.0f} €/year**.\n")
+                    if st.session_state["lang"] == "EN" else
+                    ("- 1. Chart: **Diesel-Baseline** vs **EV-Stromkosten**.\n"
+                     "- 2. Chart: **Maut-Effekt** (Diesel vs EV).\n"
+                     f"- Netto-Einsparung inkl. Maut: **{float(dv.get('total_savings_incl_toll_eur',0.0)):,.0f} €/Jahr**.\n")
+                )
+
+            with tabs[2]:
                 dfh = build_hourly_df(res)
 
                 gs_hr()
 
-                # --- Chart 1 ---
-                f1 = fig_price_co2(dfh)
+                # Chart 1 (price + CO2)
+                label_price = "Spot price (€/kWh)" if (res.get("profile", {}).get("has_price") and get_inp("price_mode") == "dynamic") else "Price (€/kWh)"
+                f1 = fig_price_co2(dfh, label_price)
                 st.pyplot(f1, use_container_width=True)
-                with st.expander("Was bedeutet das?" if st.session_state["lang"] == "DE" else "What does this mean?", expanded=False):
-                    cheap = int(dfh.loc[dfh["tou_eur_per_kwh"].idxmin(), "hour"])
-                    green = int(dfh.loc[dfh["grid_co2_g_per_kwh"].idxmin(), "hour"])
-                    st.markdown(
-                        f"- Günstigste Stunde liegt ca. bei **{cheap:02d}:00**.\n"
-                        f"- Niedrigstes Netz-CO₂ liegt ca. bei **{green:02d}:00**.\n"
-                        "- Dein Zeitfenster gewichtet Preis & CO₂ — beides kann auseinanderlaufen.\n"
-                        "- Praxis: Wenn du Kosten drücken willst → Richtung günstiger Stunden; wenn CO₂ → Richtung CO₂-Minimum.\n"
-                        if st.session_state["lang"] == "DE" else
-                        f"- Cheapest hour is around **{cheap:02d}:00**.\n"
-                        f"- Lowest grid CO₂ hour is around **{green:02d}:00**.\n"
-                        "- Your charging window weights both price and CO₂ — they don’t necessarily match.\n"
-                        "- Practical: optimise for cost vs CO₂ depending on your goal.\n"
-                    )
 
                 gs_hr()
 
-                # --- Chart 2 ---
+                # Chart 2 (load profile)
                 f2 = fig_load(dfh, res["inputs"]["site_capacity_limit_kva"], res["load"]["new_theoretical_peak_kw"])
                 st.pyplot(f2, use_container_width=True)
-                with st.expander("Was bedeutet das?" if st.session_state["lang"] == "DE" else "What does this mean?", expanded=False):
-                    peak = float(res["load"]["new_theoretical_peak_kw"])
-                    cap = float(res["inputs"].get("site_capacity_limit_kva", 0.0))
-                    ok = bool(res["load"].get("capacity_ok", True))
-                    st.markdown(
-                        f"- **Theoretischer Peak** (alle Lader voll): **{peak:,.0f} kW**.\n"
-                        + (f"- **Standort-Limit**: **{cap:,.0f} kVA**.\n" if cap > 0 else "")
-                        + (f"- Status: **{'OK' if ok else 'ÜBERSCHRITTEN'}**.\n" if st.session_state["lang"] == "DE" else
-                        f"- Status: **{'OK' if ok else 'EXCEEDED'}**.\n")
-                        + ("- Wenn überschritten: Lastmanagement, Ladefenster entzerren, geringere Ladeleistung, oder Anschluss ausbauen.\n"
-                        if st.session_state["lang"] == "DE" else
-                        "- If exceeded: load management, stagger charging, reduce charger power, or increase site capacity.\n")
-                    )
 
                 gs_hr()
 
-                # --- Chart 3 ---
+                # Chart 3 (waterfall)
                 f3 = fig_waterfall(res)
                 st.pyplot(f3, use_container_width=True)
-                with st.expander("Was bedeutet das?" if st.session_state["lang"] == "DE" else "What does this mean?", expanded=False):
-                    dv = res["diesel_vs_ev"]
-                    st.markdown(
-                        f"- Start ist **Diesel-Kosten** (Baseline).\n"
-                        f"- Dann wird **EV-Strom** abgezogen.\n"
-                        f"- **Maut-Ersparnis** kommt hinzu (falls EV mautbefreit).\n"
-                        f"- Ergebnis: **Netto-Einsparung** = **{float(dv.get('total_savings_incl_toll_eur',0.0)):,.0f} €/Jahr**.\n"
-                        if st.session_state["lang"] == "DE" else
-                        f"- Start is **diesel baseline cost**.\n"
-                        f"- Then **EV electricity cost** is subtracted.\n"
-                        f"- **Toll savings** added (if EV is toll-exempt).\n"
-                        f"- Result: **net savings** = **{float(dv.get('total_savings_incl_toll_eur',0.0)):,.0f} €/year**.\n"
-                    )
 
                 gs_hr()
 
-                # --- Chart 4 ---
+                # Chart 4 (pareto)
                 f4 = fig_pareto_shifted_windows(res)
                 st.pyplot(f4, use_container_width=True)
-                with st.expander("Was bedeutet das?" if st.session_state["lang"] == "DE" else "What does this mean?", expanded=False):
-                    st.markdown(
-                        "- Jeder Punkt = gleich langes Ladefenster, nur **Startzeit verschoben**.\n"
-                        "- **Links** = günstiger, **unten** = weniger CO₂.\n"
-                        "- Die Zahl am Punkt ist die **Startstunde**.\n"
-                        "- Damit findest du schnell ein Ladefenster, das Kosten/CO₂ besser balanciert.\n"
-                        if st.session_state["lang"] == "DE" else
-                        "- Each point = same window length, shifted start time.\n"
-                        "- **Left** = cheaper, **down** = lower CO₂.\n"
-                        "- The label is the **start hour**.\n"
-                        "- Use this to pick a better cost/CO₂ trade-off window.\n"
-                    )
 
-
-            with tabs[2]:
+            with tabs[3]:
                 df_calc = build_calculation_df(res)
                 st.dataframe(df_calc, use_container_width=True, hide_index=True)
 
                 with st.expander("Full model output (JSON)", expanded=False):
                     st.json(res)
 
-            with tabs[3]:
-                st.caption("Tornado (±20% on key parameters) / Optional Monte-Carlo kannst du danach ergänzen.")
-                if st.button("Run tornado", use_container_width=True):
-                    base = res["inputs"].copy()
-                    base_savings = float(res["diesel_vs_ev"]["total_savings_incl_toll_eur"])
-
-                    params = [
-                        ("Electricity price (€/MWh)", "avg_elec_price_eur_per_mwh", 0.20),
-                        ("Diesel price (€/L)", "diesel_price_eur_per_l", 0.15),
-                        ("EV consumption (kWh/km)", "ev_consumption_kwh_per_km", 0.15),
-                        ("Diesel L/100km", "diesel_l_per_100km", 0.15),
-                        ("Events / truck / day", "events_per_truck_per_day", 0.20),
-                        ("Tolled share", "tolled_share_0_1", 0.20),
-                        ("Toll rate (€/km)", "toll_rate_eur_per_km", 0.20),
-                    ]
-
-                    impacts = []
-                    for label, key, pct in params:
-                        lo = base.copy()
-                        hi = base.copy()
-
-                        def clamp(k, v):
-                            if k in ("start_soc", "target_soc", "dynamic_price_share", "tolled_share_0_1"):
-                                return float(min(max(v, 0.0), 1.0))
-                            return float(max(v, 0.0))
-
-                        lo[key] = clamp(key, base[key] * (1 - pct))
-                        hi[key] = clamp(key, base[key] * (1 + pct))
-
-                        r_lo = run_model(**lo)
-                        r_hi = run_model(**hi)
-                        s_lo = float(r_lo["diesel_vs_ev"]["total_savings_incl_toll_eur"]) - base_savings
-                        s_hi = float(r_hi["diesel_vs_ev"]["total_savings_incl_toll_eur"]) - base_savings
-
-                        impacts.append((label, s_lo, s_hi))
-
-                    df_imp = pd.DataFrame(impacts, columns=["Parameter", "Delta_low", "Delta_high"])
-                    df_imp["Range"] = (df_imp["Delta_high"] - df_imp["Delta_low"]).abs()
-                    df_imp = df_imp.sort_values("Range", ascending=False)
-
-                    fig, ax = plt.subplots(figsize=(9, 5))
-                    y = np.arange(len(df_imp))
-                    left = df_imp[["Delta_low", "Delta_high"]].min(axis=1)
-                    right = df_imp[["Delta_low", "Delta_high"]].max(axis=1)
-                    ax.barh(y, right - left, left=left)
-                    ax.axvline(0, linestyle="--", alpha=0.5)
-                    ax.set_yticks(y)
-                    ax.set_yticklabels(df_imp["Parameter"])
-                    ax.set_xlabel("Impact on total savings (€/year)")
-                    ax.grid(True, axis="x", alpha=0.2)
-                    fig.tight_layout()
-                    st.pyplot(fig, use_container_width=True)
-
             with tabs[4]:
+                st.caption("Tornado (±20% on key parameters) / Optional Monte-Carlo kannst du danach ergänzen.")
+
+                if st.button("Run tornado", use_container_width=True, key="run_tornado_btn"):
+                    with st.spinner("Running tornado…"):
+                        try:
+                            res2 = st.session_state.get("model_results")
+                            if not res2:
+                                st.error("No model results available.")
+                                st.stop()
+
+                            base = res2["inputs"].copy()  # <- WICHTIG: das sind exakt die run_model() Parameter
+                            base_savings = float(res2["diesel_vs_ev"]["total_savings_incl_toll_eur"])
+
+                            # Spot-Infos mitgeben (falls vorhanden), damit Tornado konsistent zum aktuellen Run bleibt
+                            prof = res2.get("profile", {}) or {}
+                            spot_curve = prof.get("spot_curve_avg_eur_per_kwh", None)
+                            spot_window = prof.get("spot_window_avg_eur_per_kwh", None)
+
+                            params = [
+                                ("Electricity price (€/MWh)", "avg_elec_price_eur_per_mwh", 0.20),
+                                ("Diesel price (€/L)", "diesel_price_eur_per_l", 0.15),
+                                ("EV consumption (kWh/km)", "ev_consumption_kwh_per_km", 0.15),
+                                ("Diesel L/100km", "diesel_l_per_100km", 0.15),
+                                ("Events / truck / day", "events_per_truck_per_day", 0.20),
+                                ("Tolled share", "tolled_share_0_1", 0.20),
+                                ("Toll rate (€/km)", "toll_rate_eur_per_km", 0.20),
+                            ]
+
+                            missing = [k for _, k, _ in params if k not in base]
+                            if missing:
+                                st.error(
+                                    "Tornado kann nicht laufen, weil diese Keys im `res['inputs']` fehlen:\n"
+                                    + ", ".join(missing)
+                                    + "\n\nDas passiert, wenn du irgendwo auf UI-Keys umgestellt hast (z.B. `site_capacity_kva`) "
+                                    "und Tornado noch `run_model`-Keys erwartet."
+                                )
+                                st.stop()
+
+                            def clamp(k, v):
+                                v = float(v)
+                                if k in ("start_soc", "target_soc", "dynamic_price_share", "tolled_share_0_1"):
+                                    return float(min(max(v, 0.0), 1.0))
+                                return float(max(v, 0.0))
+
+                            impacts = []
+                            for label, key, pct in params:
+                                lo = base.copy()
+                                hi = base.copy()
+
+                                lo[key] = clamp(key, float(base[key]) * (1 - pct))
+                                hi[key] = clamp(key, float(base[key]) * (1 + pct))
+
+                                r_lo = run_model(
+                                    **lo,
+                                    spot_curve_avg_eur_per_kwh=spot_curve,
+                                    spot_window_avg_eur_per_kwh=spot_window,
+                                )
+                                r_hi = run_model(
+                                    **hi,
+                                    spot_curve_avg_eur_per_kwh=spot_curve,
+                                    spot_window_avg_eur_per_kwh=spot_window,
+                                )
+
+                                s_lo = float(r_lo["diesel_vs_ev"]["total_savings_incl_toll_eur"]) - base_savings
+                                s_hi = float(r_hi["diesel_vs_ev"]["total_savings_incl_toll_eur"]) - base_savings
+                                impacts.append((label, s_lo, s_hi))
+
+                            df_imp = pd.DataFrame(impacts, columns=["Parameter", "Delta_low", "Delta_high"])
+                            df_imp["Range"] = (df_imp["Delta_high"] - df_imp["Delta_low"]).abs()
+                            df_imp = df_imp.sort_values("Range", ascending=False)
+
+                            fig, ax = plt.subplots(figsize=(9, 5))
+                            y = np.arange(len(df_imp))
+                            left = df_imp[["Delta_low", "Delta_high"]].min(axis=1)
+                            right = df_imp[["Delta_low", "Delta_high"]].max(axis=1)
+                            ax.barh(y, right - left, left=left)
+                            ax.axvline(0, linestyle="--", alpha=0.5)
+                            ax.set_yticks(y)
+                            ax.set_yticklabels(df_imp["Parameter"])
+                            ax.set_xlabel("Impact on total savings (€/year)")
+                            ax.grid(True, axis="x", alpha=0.2)
+                            fig.tight_layout()
+
+                            st.pyplot(fig, use_container_width=True)
+                            st.dataframe(df_imp, use_container_width=True, hide_index=True)
+
+                        except Exception as e:
+                            st.exception(e)
+
+
+            with tabs[5]:
                 df_calc = build_calculation_df(res)
                 dfh = build_hourly_df(res)
 
@@ -2084,9 +2579,8 @@ with left:
                     use_container_width=True
                 )
 
-                # PDF with charts
                 charts = [
-                    ("TOU price & grid CO₂", fig_to_png_bytes(fig_price_co2(dfh))),
+                    ("Price & grid CO₂", fig_to_png_bytes(fig_price_co2(dfh, "Price (€/kWh)"))),
                     ("Site load profile", fig_to_png_bytes(fig_load(dfh, res["inputs"]["site_capacity_limit_kva"], res["load"]["new_theoretical_peak_kw"]))),
                     ("Cost waterfall", fig_to_png_bytes(fig_waterfall(res))),
                     ("Pareto (shift window)", fig_to_png_bytes(fig_pareto_shifted_windows(res))),

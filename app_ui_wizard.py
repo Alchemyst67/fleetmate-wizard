@@ -1,16 +1,11 @@
-# FleetMate — patched Streamlit app (2026-01-10)
+# FleetMate — Streamlit app (2026-01-12)
 # - Removes manual SoC inputs; derives SoC from km/day
 # - EV consumption defaults adjusted to realistic range (0.8–1.2)
 # - Replaces "dynamic share" with Fixed vs Dynamic price mode
 # - Adds load profile CSV upload + charging-window capacity analysis
 # - Updates toll defaults to ASFINAG-like values (simplified)
 # - Adds clearer finance charts ordering
-#
-# NOTE: This file assumes `recommendations.py` exists next to it with:
-#   - detect_issues(results: dict) -> list
-#   - generate_solution_set(results: dict, issues: list) -> list
-#
-# Run: streamlit run fleetmate_app_patched.py
+
 
 import os
 import json
@@ -28,8 +23,7 @@ import matplotlib
 matplotlib.use("Agg")  # important in Docker/Headless
 import matplotlib.pyplot as plt
 
-from recommendations import detect_issues, generate_solution_set
-
+from recommendations import *
 
 # =========================================================
 # Auth
@@ -341,6 +335,8 @@ def run_model(
 # Defaults + persistent input storage
 # =========================================================
 DEFAULT_LANG = "DE"
+# English comments: theme defaults
+DEFAULT_THEME = "system"
 
 DEFAULT_INPUTS = dict(
     # Fleet
@@ -363,21 +359,21 @@ DEFAULT_INPUTS = dict(
 
     # Electricity
     price_mode="fixed",           # "fixed" | "dynamic"
-    fixed_elec_price_mwh=200.0,   # used when price_mode=fixed
+    fixed_elec_price_mwh=86.79,   # used when price_mode=fixed
     # Internals (computed):
-    avg_elec_price_mwh=200.0,     # gets set to fixed price or last-year spot average
+    avg_elec_price_mwh=86.79,     # gets set to fixed price or last-year spot average
     dynamic_share=0.0,            # 0=fixed, 1=dynamic
 
     # Charging window
     start_hour=22,
-    end_hour=8,
-    charging_window_hours=10.0,
+    end_hour=6,
+    charging_window_hours=8.0,
 
     # Site / capacity
     # Manual fallback (if no load profile uploaded)
-    existing_peak_kw=300.0,
+    existing_peak_kw=3000.0,
     charger_power_kw=150.0,
-    site_capacity_kva=630.0,
+    site_capacity_kva=5530.0,
 
     # Optional peak limit
     desired_peak_limit_kw=0.0,
@@ -386,7 +382,7 @@ DEFAULT_INPUTS = dict(
     # Diesel baseline + toll
     market_region="AT",
     diesel_price=1.75,
-    diesel_l_per_100=28.0,
+    diesel_l_per_100=22.0,
 
     # Toll (default updated; simplified ASFINAG-style rate for 4+ axles EURO VI-ish)
     # NOTE: Real GO-toll depends on axles + emission classes + special sections. Keep editable.
@@ -407,6 +403,7 @@ ALLOWED_INPUT_KEYS = set(DEFAULT_INPUTS.keys()) - HIDDEN_OR_CONTROLLED
 
 def ensure_defaults():
     st.session_state.setdefault("lang", DEFAULT_LANG)
+    st.session_state.setdefault("theme", DEFAULT_THEME)  # English comment: persist theme across reruns
     st.session_state.setdefault("inputs", DEFAULT_INPUTS.copy())
 
     # Flow control
@@ -1152,6 +1149,33 @@ def call_gemini_report(results: dict, issues: list, solutions: list) -> str:
     return text or ""
 
 
+def call_gemini_markdown(prompt: str) -> str:
+    api_key = _gemini_key()
+    if not api_key:
+        return ""
+
+    model = _gemini_model()
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+    params = {"key": api_key}
+
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"temperature": 0.25, "maxOutputTokens": 750},
+    }
+
+    try:
+        resp = requests.post(url, params=params, json=payload, timeout=30)
+        if resp.status_code >= 300:
+            return ""
+        data = resp.json()
+        cands = data.get("candidates", [])
+        parts = cands[0].get("content", {}).get("parts", []) if cands else []
+        text = "\n".join([p.get("text", "") for p in parts if isinstance(p, dict) and p.get("text")]).strip()
+        return text or ""
+    except Exception:
+        return ""
+
+
 # =========================================================
 # UI helpers + formatting
 # =========================================================
@@ -1303,6 +1327,8 @@ def build_report_pdf_bytes(title: str, kpis: dict, narrative_md: str, issues: li
 # =========================================================
 def reset_all():
     lang = st.session_state.get("lang", DEFAULT_LANG)
+    theme = st.session_state.get("theme", DEFAULT_THEME)  # English comment: keep theme on reset
+
     st.session_state["inputs"] = DEFAULT_INPUTS.copy()
     st.session_state["lang"] = lang
     st.session_state["wizard_step"] = 0
@@ -1613,6 +1639,8 @@ def fig_pareto_shifted_windows(res: dict):
         ax.set_ylabel("EV CO₂ (kg/year)")
         ax.grid(True, alpha=0.2)
         fig.tight_layout()
+        st.session_state["pareto_df"] = df
+        st.session_state["pareto_win_len"] = win_len
         return fig
 
     except Exception as e:
@@ -1631,12 +1659,148 @@ def fig_to_png_bytes(fig) -> bytes:
     plt.close(fig)
     return buf.getvalue()
 
+def inject_theme_css(theme: str):
+    theme = (theme or "system").strip().lower()
+
+    THEMES = {
+        "dark": {
+            "--bg1": "#070a12",
+            "--bg2": "#070a12",
+            "--card": "rgba(255,255,255,0.10)",
+            "--card2": "rgba(255,255,255,0.14)",
+            "--stroke": "rgba(255,255,255,0.16)",
+            "--a1": "rgba(58,141,255,0.50)",
+            "--a2": "rgba(255,152,0,0.32)",
+            "--a3": "rgba(168,85,247,0.30)",
+            "--a4": "rgba(34,211,238,0.22)",
+            "--glass": "rgba(255,255,255,0.14)",
+            "--glass2": "rgba(255,255,255,0.08)",
+            "--txt": "rgba(255,255,255,0.92)",
+            "--muted": "rgba(255,255,255,0.70)",
+            "--inputBg": "rgba(255,255,255,0.92)",
+            "--inputTxt": "#0b0d12",
+            "--placeholder": "rgba(20,20,30,0.55)",
+        },
+        "light": {
+            "--bg1": "#f6f7fb",
+            "--bg2": "#eef1f7",
+            "--card": "rgba(255,255,255,0.70)",
+            "--card2": "rgba(255,255,255,0.86)",
+            "--stroke": "rgba(10,12,18,0.10)",
+            "--a1": "rgba(58,141,255,0.22)",
+            "--a2": "rgba(255,152,0,0.14)",
+            "--a3": "rgba(168,85,247,0.14)",
+            "--a4": "rgba(34,211,238,0.12)",
+            "--glass": "rgba(255,255,255,0.72)",
+            "--glass2": "rgba(255,255,255,0.52)",
+            "--txt": "rgba(10,12,18,0.92)",
+            "--muted": "rgba(10,12,18,0.62)",
+            "--inputBg": "rgba(255,255,255,0.96)",
+            "--inputTxt": "#0b0d12",
+            "--placeholder": "rgba(10,12,18,0.45)",
+        },
+    }
+
+    def vars_block(d: dict) -> str:
+        return "\n".join([f"  {k}: {v};" for k, v in d.items()])
+
+    dark_vars = vars_block(THEMES["dark"])
+    light_vars = vars_block(THEMES["light"])
+
+    if theme == "system":
+        css = f"""
+        <style>
+        :root {{
+        {dark_vars}
+        }}
+        html, body {{ color-scheme: dark; }}
+
+        @media (prefers-color-scheme: light) {{
+          :root {{
+          {light_vars}
+          }}
+          html, body {{ color-scheme: light; }}
+        }}
+
+        /* BaseWeb inputs readable in both modes */
+        div[data-baseweb="input"] input,
+        div[data-baseweb="textarea"] textarea {{
+          background: var(--inputBg) !important;
+          color: var(--inputTxt) !important;
+        }}
+        div[data-baseweb="input"] input::placeholder,
+        div[data-baseweb="textarea"] textarea::placeholder {{
+          color: var(--placeholder) !important;
+        }}
+        </style>
+        """
+    else:
+        t = THEMES["light"] if theme == "light" else THEMES["dark"]
+        scheme = "light" if theme == "light" else "dark"
+        css = f"""
+        <style>
+        :root {{
+        {vars_block(t)}
+        }}
+        html, body {{ color-scheme: {scheme}; }}
+
+        div[data-baseweb="input"] input,
+        div[data-baseweb="textarea"] textarea {{
+          background: var(--inputBg) !important;
+          color: var(--inputTxt) !important;
+        }}
+        div[data-baseweb="input"] input::placeholder,
+        div[data-baseweb="textarea"] textarea::placeholder {{
+          color: var(--placeholder) !important;
+        }}
+        </style>
+        """
+
+    st.markdown(css, unsafe_allow_html=True)
+
+def tornado_takeaways(df, top_n=3):
+    d = df.sort_values("Range", ascending=False).head(top_n)
+    out = []
+    for _, r in d.iterrows():
+        direction = "steigt" if r["Delta_high"] > 0 else "fällt"
+        out.append(
+            f"- **{r['Parameter']}** ist ein Top-Hebel (Spannweite ~{r['Range']:,.0f} €/Jahr). "
+            f"Wenn der Wert **hoch** geht, {direction} die Ersparnis."
+        )
+    out.append("- Das ist **ceteris paribus**: jeweils nur **ein** Parameter wird verändert.")
+    return "\n".join(out)
+
+
+def fmt_eur_per_kwh(x):
+    try:
+        return f"{float(x):,.3f} €/kWh"
+    except Exception:
+        return "—"
+
+def fmt_eur_per_mwh(x):
+    try:
+        return f"{float(x):,.1f} €/MWh"
+    except Exception:
+        return "—"
+
+def chart_note(lines: list[str], metrics: dict[str, str] | None = None, expanded: bool = False):
+    """Uniformer Erklärungstext unter Charts + optionale KPI-Zeile."""
+    with st.expander("Kurz erklärt (mit Werten)", expanded=expanded):
+        if lines:
+            st.markdown("\n".join([f"- {l}" for l in lines]))
+        if metrics:
+            cols = st.columns(min(4, len(metrics)))
+            for i, (k, v) in enumerate(metrics.items()):
+                cols[i % len(cols)].metric(k, v)
+
+
 
 # =========================================================
 # Page config + styling (kept)
 # =========================================================
 st.set_page_config(page_title="FleetMate — Guided Intake", layout="wide")
 require_login()
+
 
 st.markdown("""
 <style>
@@ -1663,6 +1827,7 @@ st.markdown("""
   --muted: rgba(255,255,255,0.70);
 }
 
+
 html, body, [class*="css"]  {
   font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
 }
@@ -1677,10 +1842,30 @@ html, body, [class*="css"]  {
     linear-gradient(180deg, var(--bg1), var(--bg2));
 }
 
-.block-container {padding-top: 2.2rem; padding-bottom: 2.8rem; max-width: 1320px;}
+.block-container{
+  padding-top: 2.2rem;
+  padding-bottom: 2.8rem;
+  max-width: 100% !important;     /* fluid */
+  padding-left: 2.2rem;
+  padding-right: 2.2rem;
+}
+
+@media (max-width: 900px){
+  .block-container{ padding-left: 1rem; padding-right: 1rem; }
+}
+
 div[data-testid="stVerticalBlock"]{gap: 0.75rem;}
 
+/* Base: containers are neutral (prevents “everything is a card”) */
 div[data-testid="stContainer"]{
+  background: transparent;
+  border: none !important;
+  box-shadow: none;
+  padding: 0;
+}
+
+/* Card look ONLY if the container contains our marker */
+div[data-testid="stContainer"]:has(.gs-card-marker){
   background: linear-gradient(180deg, var(--card2), var(--card));
   border: 1px solid var(--stroke) !important;
   border-radius: var(--radius) !important;
@@ -1688,6 +1873,9 @@ div[data-testid="stContainer"]{
   padding: 1.05rem 1.1rem;
   backdrop-filter: blur(14px);
 }
+
+.gs-card-marker{ display:none; }
+
 
 div[data-baseweb="input"] input,
 div[data-baseweb="textarea"] textarea{
@@ -1699,7 +1887,10 @@ div[data-baseweb="input"] input::placeholder,
 div[data-baseweb="textarea"] textarea::placeholder{
   color: rgba(20,20,30,0.55) !important;
 }
+
+/* Ensure general text stays readable */
 label, .stMarkdown, .stCaption {color: var(--txt) !important;}
+[data-testid="stCaptionContainer"], [data-testid="stCaptionContainer"] * { color: var(--muted) !important; }
 .small-note{font-size:0.90rem; color: var(--muted);}
 
 .gs-hr{border:none; height:1px; background: rgba(255,255,255,0.14); margin: 0.55rem 0;}
@@ -1731,6 +1922,30 @@ label, .stMarkdown, .stCaption {color: var(--txt) !important;}
 
 div[role="radiogroup"]{gap: 0.55rem;}
 
+/* Fix radio label text (e.g. "Fragebogen / Report", "DE / EN") */
+div[data-testid="stRadio"] label,
+div[data-testid="stRadio"] label *,
+div[role="radiogroup"] label,
+div[role="radiogroup"] label * {
+  color: var(--txt) !important;
+}
+
+/* Fix tabs text (e.g. "Übersicht / Finanzen / Charts / Berechnungen ...") */
+div[data-testid="stTabs"] button,
+div[data-testid="stTabs"] button *,
+div[data-baseweb="tab"] button,
+div[data-baseweb="tab"] button * {
+  color: var(--muted) !important;
+}
+
+/* Active tab brighter */
+div[data-testid="stTabs"] button[aria-selected="true"],
+div[data-testid="stTabs"] button[aria-selected="true"] *,
+div[data-baseweb="tab"][aria-selected="true"] button,
+div[data-baseweb="tab"][aria-selected="true"] button * {
+  color: var(--txt) !important;
+}
+
 div[data-testid="stMetric"] *{ color: var(--txt) !important; }
 div[data-testid="stMetricLabel"]{ color: var(--muted) !important; }
 div[data-testid="stMetricDelta"]{ color: var(--muted) !important; }
@@ -1748,6 +1963,7 @@ details summary, details summary *{ color: var(--txt) !important; }
 }
 </style>
 """, unsafe_allow_html=True)
+
 
 
 # =========================================================
@@ -1798,22 +2014,45 @@ with top_l:
     st.markdown(f"<p class='gs-sub'>{t('welcome_sub')}</p>", unsafe_allow_html=True)
 
 with top_r:
-    current = st.session_state.get("lang", DEFAULT_LANG)
-    lang = st.radio(
-        "",
-        options=["DE", "EN"],
-        index=0 if current == "DE" else 1,
-        horizontal=True,
-        label_visibility="collapsed",
-        key="lang_switch",
-    )
-    if lang != current:
-        st.session_state["lang"] = lang
-        st.session_state["charts_md"] = None
-        st.session_state["report_md"] = None
-        st.session_state["report_meta"] = None
-        st.session_state["report_pdf_bytes"] = None
-        st.rerun()
+    c_lang, c_theme = st.columns([0.55, 0.45], vertical_alignment="center")
+
+    with c_lang:
+        current_lang = st.session_state.get("lang", DEFAULT_LANG)
+        lang = st.radio(
+            "",
+            options=["DE", "EN"],
+            index=0 if current_lang == "DE" else 1,
+            horizontal=True,
+            label_visibility="collapsed",
+            key="lang_switch",
+        )
+        if lang != current_lang:
+            st.session_state["lang"] = lang
+            st.session_state["charts_md"] = None
+            st.session_state["report_md"] = None
+            st.session_state["report_meta"] = None
+            st.session_state["report_pdf_bytes"] = None
+            st.rerun()
+
+    with c_theme:
+        # English comment: simple theme selector (kept minimal)
+        current_theme = st.session_state.get("theme", DEFAULT_THEME)
+        theme = st.radio(
+            "",
+            options=["system", "dark", "light"],
+            index=["system","dark","light"].index(st.session_state.get("theme", DEFAULT_THEME)),
+            horizontal=True,
+            format_func=lambda v: "🖥️" if v=="system" else ("🌙" if v=="dark" else "☀️"),
+            label_visibility="collapsed",
+            key="theme_switch",
+        )
+        if theme != st.session_state.get("theme"):
+            st.session_state["theme"] = theme
+            st.rerun()
+
+    # IMPORTANT: inject theme CSS AFTER the switch so it applies immediately
+    inject_theme_css(st.session_state.get("theme", DEFAULT_THEME))
+
 
 left, right = st.columns([0.62, 0.38], gap="large")
 
@@ -1823,6 +2062,8 @@ with right:
     step_name = step_title(step)
 
     with st.container(border=True):
+        st.markdown("<span class='gs-card-marker'></span>", unsafe_allow_html=True)
+
         st.markdown(f"### {t('live_preview')}")
         res = st.session_state.get("model_results")
         if not res:
@@ -1855,6 +2096,8 @@ with right:
                 )
 
     with st.container(border=True):
+        st.markdown("<span class='gs-card-marker'></span>", unsafe_allow_html=True)
+
         st.markdown(f"### 💬 {t('assistant_title')}")
         st.markdown(f"<div class='small-note'>{t('assistant_hint')}</div>", unsafe_allow_html=True)
 
@@ -1902,6 +2145,8 @@ with left:
         st.progress(pct, text=f"{t('progress')}: {pct}%")
 
         with st.container(border=True):
+            st.markdown("<span class='gs-card-marker'></span>", unsafe_allow_html=True)
+
             sid = step["id"]
             lang = st.session_state.get("lang", DEFAULT_LANG)
 
@@ -1933,25 +2178,25 @@ with left:
                 PROFILES = {
                     "city": {
                         "label_en": "City / Last‑Mile", "label_de": "City / Last‑Mile",
-                        "battery_kwh": 220.0, "ev_consumption": 0.9,
+                        "battery_kwh": 220.0, "ev_consumption": 0.8,
                         "desc_en": "Short routes, lots of stops. Typical consumption: 0.7–1.1 kWh/km.",
                         "desc_de": "Kurze Strecken, viele Stopps. Typischer Verbrauch: 0,7–1,1 kWh/km.",
                     },
                     "regional": {
                         "label_en": "Regional Distribution", "label_de": "Regionale Distribution",
-                        "battery_kwh": 350.0, "ev_consumption": 1.0,
+                        "battery_kwh": 350.0, "ev_consumption": 0.9,
                         "desc_en": "Mixed urban + regional. Typical consumption: 0.8–1.2 kWh/km.",
                         "desc_de": "Mix aus Stadt + Region. Typischer Verbrauch: 0,8–1,2 kWh/km.",
                     },
                     "heavy_regional": {
                         "label_en": "Heavy Regional (mixed)", "label_de": "Schwer regional (gemischt)",
-                        "battery_kwh": 500.0, "ev_consumption": 1.1,
+                        "battery_kwh": 500.0, "ev_consumption": 1.0,
                         "desc_en": "Heavier loads. Typical consumption: ~1.0–1.3 kWh/km.",
                         "desc_de": "Schwerere Lasten. Typischer Verbrauch: ~1,0–1,3 kWh/km.",
                     },
                     "long_haul": {
                         "label_en": "Long‑haul / 40t", "label_de": "Langstrecke / 40t",
-                        "battery_kwh": 650.0, "ev_consumption": 1.2,
+                        "battery_kwh": 650.0, "ev_consumption": 1.1,
                         "desc_en": "Long-haul baseline (kept conservative). If you have measured data, fine-tune.",
                         "desc_de": "Langstrecke Basis (konservativ). Mit Messdaten bitte feinjustieren.",
                     },
@@ -2043,7 +2288,7 @@ with left:
                         sid, "fixed_elec_price_mwh",
                         "Fixed electricity price (€/MWh)" if lang == "EN" else "Fixer Strompreis (€/MWh)",
                         min_value=0.0, max_value=2000.0, step=10.0,
-                        help=("Example: 200 €/MWh = 0.20 €/kWh" if lang == "EN" else "Beispiel: 200 €/MWh = 0,20 €/kWh")
+                        help=("Standard: Germany average 86.79 €/MWh" if lang == "EN" else "Standard: Deutscher Durchschnitt 86,79 €/MWh")
                     )
                 else:
                     st.info(
@@ -2055,7 +2300,7 @@ with left:
                     )
                     bind_number(
                         sid, "fixed_elec_price_mwh",
-                        "Fallback price if no spot data (€/MWh)" if lang == "EN" else "Fallback-Preis falls keine Spotdaten (€/MWh)",
+                        "Fallback price if no spot data (86.79 €/MWh)" if lang == "EN" else "Fallback-Preis falls keine Spotdaten (86,79 €/MWh)",
                         min_value=0.0, max_value=2000.0, step=10.0,
                     )
 
@@ -2388,17 +2633,34 @@ with left:
                 gs_hr()
 
                 with st.container(border=True):
-                    st.markdown("### " + t("narrative"))
-                    if st.session_state.get("report_md") is None:
-                        md = call_gemini_report(res, issues, solutions)
-                        st.session_state["report_md"] = md if md else t("gemini_missing")
-                        st.session_state["report_pdf_bytes"] = None
-                        st.session_state["report_meta"] = {"generated_at": datetime.datetime.utcnow().isoformat() + "Z"}
-                    st.markdown(st.session_state["report_md"])
+                    st.markdown("<span class='gs-card-marker'></span>", unsafe_allow_html=True)
+
+                    st.markdown("## Analyse & Empfehlung")
+                    st.markdown(report_analysis_markdown(res))
+
+                    st.markdown("### Constraints & Empfehlungen")
+                    constraints = report_constraints(res)
+                    if not constraints:
+                        st.success("Keine großen Constraints erkannt.")
+                    else:
+                        for lvl, txt in constraints:
+                            if lvl == "ok":
+                                st.success(txt)
+                            elif lvl == "bad":
+                                st.error(txt)
+                            else:
+                                st.warning(txt)
+
+                    st.markdown("### Nächste sinnvolle Schritte")
+                    for s in report_next_steps(res):
+                        st.markdown(f"- {s}")
+
 
                 gs_hr()
 
                 with st.container(border=True):
+                    st.markdown("<span class='gs-card-marker'></span>", unsafe_allow_html=True)
+
                     st.markdown("### " + t("constraints"))
                     if not issues:
                         st.success("No major constraints detected." if st.session_state["lang"] == "EN" else "Keine großen Constraints erkannt.")
@@ -2417,11 +2679,104 @@ with left:
                     for idx, s in enumerate(solutions, 1):
                         st.markdown(f"**{idx}. {s.get('title','')}** — {s.get('definition','')}")
 
+                gs_hr()
+
+                lang = st.session_state.get("lang", "DE")
+
+                # --- Reverse Calculation (robust, ohne Duplikate, KPI-Style bleibt) ---
+                if cap:
+                    with st.container(border=True):
+                        st.markdown("<span class='gs-card-marker'></span>", unsafe_allow_html=True)
+
+                        st.markdown(
+                            "### " + (
+                                "Reverse Calculation (how many trucks fit in the window?)"
+                                if lang == "EN" else
+                                "Reverse Calculation (wie viele LKW gehen im Ladefenster?)"
+                            )
+                        )
+
+                        c1, c2, c3, c4 = st.columns(4)
+
+                        with c1:
+                            st.metric(
+                                "Max trucks (energy)" if lang == "EN" else "Max LKW (Energie)",
+                                f"{int(cap.get('max_trucks_energy_based', 0))}"
+                            )
+
+                        with c2:
+                            st.metric(
+                                "Max trucks (simultaneous)" if lang == "EN" else "Max LKW (simultan)",
+                                f"{int(cap.get('max_trucks_simultaneous_at_full_power', 0))}"
+                            )
+
+                        with c3:
+                            st.metric(
+                                "Energy available (window)" if lang == "EN" else "Energie verfügbar (Fenster)",
+                                f"{float(cap.get('energy_available_kwh_in_window', 0.0)):,.0f} kWh"
+                            )
+
+                        with c4:
+                            st.metric(
+                                "Energy / truck / day" if lang == "EN" else "Energie / LKW / Tag",
+                                f"{float(cap.get('energy_needed_kwh_per_truck_day', 0.0)):,.0f} kWh"
+                            )
+
+                        with st.expander("Interpretation" if lang == "DE" else "Interpretation", expanded=False):
+                            st.markdown(
+                                (
+                                    "- **Energy-based**: nutzt die verfügbare Energie im gesamten Ladefenster (realistisch mit Smart Charging).\n"
+                                    "- **Simultan**: Worst-Case, alle ziehen gleichzeitig volle Leistung.\n"
+                                    f"- Ladefenster: **{int(cap.get('charging_window_hours_total', 0))} h**\n"
+                                    f"- Peak im Ladefenster: **{float(cap.get('site_peak_kw_in_window', 0.0)):,.0f} kW**\n"
+                                    f"- Headroom (Peak): **{float(cap.get('available_kw_at_peak', 0.0)):,.0f} kW**\n"
+                                ) if lang == "DE" else (
+                                    "- **Energy-based**: uses total energy available over the charging window (realistic with smart charging).\n"
+                                    "- **Simultaneous**: worst case, all trucks draw full power at the same time.\n"
+                                    f"- Charging window: **{int(cap.get('charging_window_hours_total', 0))} h**\n"
+                                    f"- Peak in window: **{float(cap.get('site_peak_kw_in_window', 0.0)):,.0f} kW**\n"
+                                    f"- Headroom (peak): **{float(cap.get('available_kw_at_peak', 0.0)):,.0f} kW**\n"
+                                )
+                            )
+                else:
+                    st.info("Reverse-Calc nicht verfügbar (capacity_analysis fehlt)." if lang == "DE"
+                            else "Reverse calc not available (capacity_analysis missing).")
+                    
+
+
+
             with tabs[1]:
                 # Finance charts (bar charts) — ordered to match the narrative (diesel vs EV, then toll)
                 f1, f2 = fig_finance_bars(res)
                 st.pyplot(f1, use_container_width=True)
+                dv = res["diesel_vs_ev"]
+                ec = res["energy_cost"]
+
+                chart_note(
+                    lines=[
+                        "Vergleicht jährliche **Diesel-Baseline** vs. **EV-Stromkosten** (nur Energie, ohne CAPEX).",
+                        "Die Differenz ist der Haupttreiber für die Einsparung."
+                    ],
+                    metrics={
+                        "Diesel (€/Jahr)": fmt_eur(dv.get("diesel_cost_baseline_eur")),
+                        "EV Strom (€/Jahr)": fmt_eur(ec.get("annual_cost_eur")),
+                        "Δ (ohne Maut)": fmt_eur(dv.get("cost_savings_eur")),
+                    },
+                )
+
                 st.pyplot(f2, use_container_width=True)
+                chart_note(
+                    lines=[
+                        "Zeigt den **Maut-Effekt** (Diesel vs. EV).",
+                        "Wenn EV mautbefreit angenommen wird, ist EV-Maut 0 €."
+                    ],
+                    metrics={
+                        "Maut Diesel (€/Jahr)": fmt_eur(dv.get("baseline_toll_cost_eur")),
+                        "Maut-Ersparnis (€/Jahr)": fmt_eur(dv.get("toll_savings_eur")),
+                        "Netto inkl. Maut": fmt_eur(dv.get("total_savings_incl_toll_eur")),
+                    },
+                )
+
 
                 dv = res["diesel_vs_ev"]
                 st.markdown(
@@ -2443,24 +2798,95 @@ with left:
                 label_price = "Spot price (€/kWh)" if (res.get("profile", {}).get("has_price") and get_inp("price_mode") == "dynamic") else "Price (€/kWh)"
                 f1 = fig_price_co2(dfh, label_price)
                 st.pyplot(f1, use_container_width=True)
+                pdets = res["energy_cost"].get("price_details", {}) or {}
+                cdets = res["co2"].get("co2_details", {}) or {}
+
+                chart_note(
+                    lines=[
+                        "Preis ist **stundenbasiert** und im Ladefenster gewichtet.",
+                        "CO₂ ist ebenfalls **stundenbasiert** (Grid-Intensität über den Tag).",
+                        f"Datenquelle Preis: {'Spot (Upload)' if pdets.get('used_spot_data') else 'TOU-Fallback/konstant'}."
+                    ],
+                    metrics={
+                        "Effektiv (€/MWh)": fmt_eur_per_mwh(res["energy_cost"].get("effective_price_eur_per_mwh")),
+                        "Ø Fenster (€/kWh)": fmt_eur_per_kwh(pdets.get("window_avg_eur_per_kwh")),
+                        "Rel-Faktor": f"{float(pdets.get('rel_factor', 1.0)):.2f}×" if pdets.get("rel_factor") is not None else "—",
+                        "CO₂ Fenster (g/kWh)": f"{float(cdets.get('grid_window_avg_g_per_kwh', 0.0)):,.0f}",
+                    },
+                )
+
 
                 gs_hr()
 
                 # Chart 2 (load profile)
                 f2 = fig_load(dfh, res["inputs"]["site_capacity_limit_kva"], res["load"]["new_theoretical_peak_kw"])
                 st.pyplot(f2, use_container_width=True)
+                cap = res.get("capacity_analysis", {}) or {}
+                load = res.get("load", {}) or {}
+
+                chart_note(
+                    lines=[
+                        "Baseline ist entweder **Upload (stündliche Maxima)** oder **manueller Peak**.",
+                        "„Spread in window“ verteilt die Ladeenergie gleichmäßig über das Ladefenster (Smart-Charging-ähnlich).",
+                        "Die gestrichelte Linie ist dein **Standortlimit**; der Punkt-Strich ist der **Worst-Case Peak** (alle Lader voll)."
+                    ],
+                    metrics={
+                        "Standortlimit": f"{float(cap.get('site_capacity_kw', 0.0)):,.0f} kW",
+                        "Peak im Fenster": f"{float(cap.get('site_peak_kw_in_window', 0.0)):,.0f} kW",
+                        "Headroom": f"{float(cap.get('available_kw_at_peak', 0.0)):,.0f} kW",
+                        "Worst-Case Peak": f"{float(load.get('new_theoretical_peak_kw', 0.0)):,.0f} kW",
+                    },
+                )
+
 
                 gs_hr()
 
                 # Chart 3 (waterfall)
                 f3 = fig_waterfall(res)
                 st.pyplot(f3, use_container_width=True)
+                dv = res["diesel_vs_ev"]
+                chart_note(
+                    lines=[
+                        "Zerlegt die jährliche Ersparnis: Diesel-Kosten minus EV-Stromkosten plus Maut-Effekt.",
+                        "Die letzten Balken sind die **Netto-Ersparnis**."
+                    ],
+                    metrics={
+                        "Diesel (€/Jahr)": fmt_eur(dv.get("diesel_cost_baseline_eur")),
+                        "EV Strom (€/Jahr)": fmt_eur(dv.get("ev_cost_eur")),
+                        "Maut Δ (€/Jahr)": fmt_eur(dv.get("toll_savings_eur")),
+                        "Netto (€/Jahr)": fmt_eur(dv.get("total_savings_incl_toll_eur")),
+                    },
+                )
+
 
                 gs_hr()
 
                 # Chart 4 (pareto)
                 f4 = fig_pareto_shifted_windows(res)
                 st.pyplot(f4, use_container_width=True)
+                pdf = st.session_state.get("pareto_df")
+                win_len = st.session_state.get("pareto_win_len")
+
+                if isinstance(pdf, pd.DataFrame) and not pdf.empty:
+                    best_cost = pdf.loc[pdf["cost"].idxmin()]
+                    best_co2 = pdf.loc[pdf["co2"].idxmin()]
+                    cur_s = int(res["inputs"].get("start_hour", 0)) % 24
+
+                    chart_note(
+                        lines=[
+                            f"Es wird **dieselbe Fensterlänge** ({int(win_len)} h) über den Tag verschoben.",
+                            "Jeder Punkt ist ein Startzeitpunkt (Label im Plot = Startstunde).",
+                            "Links unten = billig & CO₂-arm (Trade-off möglich)."
+                        ],
+                        metrics={
+                            "Günstigster Start": f"{int(best_cost['start']):02d}h (≈ {fmt_eur(best_cost['cost'])}/Jahr)",
+                            "CO₂-min Start": f"{int(best_co2['start']):02d}h (≈ {fmt_kg(best_co2['co2'])}/Jahr)",
+                            "Aktuell Start": f"{cur_s:02d}h",
+                        },
+                    )
+                else:
+                    chart_note(["Pareto-Tabelle nicht verfügbar (siehe Fehlerhinweis im Plot)."])
+
 
             with tabs[3]:
                 df_calc = build_calculation_df(res)
@@ -2470,7 +2896,6 @@ with left:
                     st.json(res)
 
             with tabs[4]:
-                st.caption("Tornado (±20% on key parameters) / Optional Monte-Carlo kannst du danach ergänzen.")
 
                 if st.button("Run tornado", use_container_width=True, key="run_tornado_btn"):
                     with st.spinner("Running tornado…"):
@@ -2555,6 +2980,27 @@ with left:
 
                             st.pyplot(fig, use_container_width=True)
                             st.dataframe(df_imp, use_container_width=True, hide_index=True)
+                            chart_note(
+                                lines=[
+                                    "Tornado = **Einfluss einzelner Parameter** auf die Netto-Ersparnis (jeweils ceteris paribus).",
+                                    "Breiter Balken = hoher Hebel → hier lohnt sich Datenqualität/Vertrag/Optimierung am meisten."
+                                ],
+                                metrics={
+                                    "Top-Hebel #1": str(df_imp.iloc[0]["Parameter"]) if len(df_imp) else "—",
+                                    "Spannweite #1": f"{float(df_imp.iloc[0]['Range']):,.0f} €/Jahr" if len(df_imp) else "—",
+                                    "Basis-Ersparnis": fmt_eur(base_savings),
+                                },
+                                expanded=True
+                            )
+
+
+                                                        # für spätere Nutzung (z.B. Export/Debug) speichern
+                            st.session_state["tornado_df"] = df_imp
+
+                            with st.expander("Was bedeutet das?", expanded=True):
+                                st.markdown(tornado_takeaways(df_imp))
+
+
 
                         except Exception as e:
                             st.exception(e)

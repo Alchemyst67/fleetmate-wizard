@@ -216,3 +216,133 @@ def generate_solution_set(results, issues):
     solutions.sort(key=lambda x: x["rank_score"], reverse=True)
 
     return solutions[:3]  # max 3 shown
+
+def _g(d, *path, default=None):
+    """safe nested get: _g(res,'a','b')"""
+    cur = d
+    for p in path:
+        if not isinstance(cur, dict) or p not in cur:
+            return default
+        cur = cur[p]
+    return cur
+
+def _fmt(x, unit="", digits=0):
+    try:
+        v = float(x)
+        if digits == 0:
+            s = f"{v:,.0f}"
+        else:
+            s = f"{v:,.{digits}f}"
+        return f"{s} {unit}".strip()
+    except Exception:
+        return "—"
+
+def _fmt_eur(x): return _fmt(x, "€", 0)
+def _fmt_kw(x):  return _fmt(x, "kW", 0)
+def _fmt_kg(x):  return _fmt(x, "kg", 0)
+
+def report_analysis_markdown(res: dict) -> str:
+    # Core KPIs
+    savings_eur = _g(res, "diesel_vs_ev", "total_savings_incl_toll_eur")
+    ev_cost_eur = _g(res, "diesel_vs_ev", "ev_cost_eur") or _g(res, "energy_cost", "annual_cost_eur")
+    co2_kg      = _g(res, "co2", "annual_savings_kg")
+
+    peak_new_kw     = _g(res, "load", "new_theoretical_peak_kw")
+    peak_window_kw  = _g(res, "capacity_analysis", "site_peak_kw_in_window")
+    headroom_kw     = _g(res, "capacity_analysis", "available_kw_at_peak")
+    cap_limit_kw    = _g(res, "capacity_analysis", "site_capacity_kw")
+
+    max_trucks_energy = _g(res, "capacity_analysis", "max_trucks_by_energy") or _g(res, "load", "max_trucks_energy")
+    rec_kw_per_truck  = _g(res, "capacity_analysis", "recommended_kw_per_truck") or _g(res, "load", "recommended_kw_per_truck")
+
+    # Data quality flags
+    used_spot = _g(res, "energy_cost", "price_details", "used_spot_data")
+    used_co2  = _g(res, "co2", "co2_details", "used_grid_data")
+
+    # Plausibility nudge (keine falsche Sicherheit)
+    plausi_hint = ""
+    try:
+        if savings_eur is not None and float(savings_eur) > 200000:
+            plausi_hint = (
+                "⚠️ **Plausibilitätscheck:** Die Einsparung ist sehr hoch. "
+                "Bitte prüfe besonders **Jahres-km**, **Dieselverbrauch**, **Dieselpreis** und **Mautannahmen** "
+                "(sonst wirkt das Ergebnis „zu gut um wahr zu sein“)."
+            )
+    except Exception:
+        pass
+
+    # Capacity status
+    cap_status = ""
+    try:
+        if headroom_kw is not None and float(headroom_kw) < 0:
+            cap_status = "🔴 **Kapazität kritisch:** Peak im Ladefenster über Standortlimit → ohne Lastmanagement/Netzausbau riskant."
+        else:
+            cap_status = "🟢 **Kapazität aktuell ok:** Peak im Ladefenster bleibt unter dem Standortlimit (mit Headroom)."
+    except Exception:
+        cap_status = "🟡 **Kapazität unklar:** Bitte Lastprofil/Limit prüfen."
+
+    # Build markdown (kurz, aber substanziell)
+    md = f"""
+### Executive Summary (aus deinen Inputs gerechnet)
+- **Einsparung (inkl. Maut):** **{_fmt_eur(savings_eur)} pro Jahr**
+- **CO₂-Ersparnis:** **{_fmt_kg(co2_kg)} pro Jahr**
+- **EV-Stromkosten:** **{_fmt_eur(ev_cost_eur)} pro Jahr**
+- **Netz/Last:** neuer theoretischer Peak **{_fmt_kw(peak_new_kw)}**, Peak im Ladefenster **{_fmt_kw(peak_window_kw)}**, Headroom **{_fmt_kw(headroom_kw)}** (Limit **{_fmt_kw(cap_limit_kw)}**)
+
+{plausi_hint}
+
+### Was treibt das Ergebnis wirklich?
+- Haupthebel sind typischerweise **Dieselpreis × Jahres-km × Verbrauch** vs. **effektiver Strompreis im Ladefenster**.
+- Das Ladefenster entscheidet, ob du **billige/CO₂-ärmere Stunden** triffst – oder teuer/dirty lädst.
+- Datenqualität: Strompreis = **{"Spot/Upload" if used_spot else "Fallback/Annahme"}**, CO₂ = **{"Grid/Upload" if used_co2 else "Fallback/Annahme"}**.
+
+### Infrastruktur-Realität (nicht Marketing)
+- {cap_status}
+- Energetisch schaffst du in deinem Setup ungefähr **{_fmt(max_trucks_energy, 'Lkw')}** (Energie-Kriterium).
+- Richtwert Ladeleistung: **{_fmt_kw(rec_kw_per_truck)} pro Lkw** (für dein Fenster/Profil).
+
+### Empfehlung (konkret)
+1) **Lastgang + Limit verifizieren** (Netzbetreiber/Smart Meter): Peak im Ladefenster ist der Showstopper – nicht „Durchschnitt“.
+2) **Ladefenster optimieren** (Start/Ende so legen, dass Preis & CO₂ im Fenster niedrig sind).
+3) **Lastmanagement definieren**: Priorisierung (frühe Abfahrten), maximale Standort-kW, dynamische Drosselung.
+4) **Business-Check**: Die Top-4 Inputs (km/Jahr, l/100km, Dieselpreis, Maut) als „Proof“ dokumentieren → erhöht Glaubwürdigkeit massiv.
+"""
+    return md.strip()
+
+def report_constraints(res: dict) -> list[tuple[str, str]]:
+    """returns list of (level, text) where level in {'ok','warn','bad'}"""
+    out = []
+    headroom_kw = _g(res, "capacity_analysis", "available_kw_at_peak")
+    used_spot = _g(res, "energy_cost", "price_details", "used_spot_data")
+    used_co2  = _g(res, "co2", "co2_details", "used_grid_data")
+
+    try:
+        if headroom_kw is not None and float(headroom_kw) < 0:
+            out.append(("bad", "Kapazität im Ladefenster überschritten → ohne Lastmanagement/Netzausbau nicht belastbar."))
+        else:
+            out.append(("ok", "Kapazität im Ladefenster aktuell ok (Headroom vorhanden)."))
+    except Exception:
+        out.append(("warn", "Kapazität konnte nicht sauber bewertet werden."))
+
+    if not used_spot:
+        out.append(("warn", "Strompreis basiert auf Annahmen/Fallback → Upload von Spot/TOU-Daten erhöht Genauigkeit."))
+    if not used_co2:
+        out.append(("warn", "CO₂ basiert auf Annahmen/Fallback → Upload von Grid-CO₂-Profil verbessert Aussage."))
+
+    return out
+
+def report_next_steps(res: dict) -> list[str]:
+    headroom_kw = _g(res, "capacity_analysis", "available_kw_at_peak")
+    steps = []
+    steps.append("**Heute (30 min):** Inputs plausibilisieren (km/Jahr, Verbrauch, Dieselpreis, Maut) – sonst sind Top-Zahlen wertlos.")
+    steps.append("**Diese Woche:** Lastprofil/Limit fixieren (Messdaten/Netzbetreiber) + Ladefenster/Abfahrtszeiten als harte Constraints definieren.")
+    try:
+        if headroom_kw is not None and float(headroom_kw) < 0:
+            steps.append("**Priorität A:** Lastmanagement/Peak-Shaving planen (Drosselung, Staffelung, ggf. Batterie/PV/Netzausbau).")
+        else:
+            steps.append("**Priorität A:** Smart-Charging-Regeln implementieren (max kW am Standort + Prioritäten nach Abfahrt).")
+    except Exception:
+        steps.append("**Priorität A:** Kapazitätslage klären (Headroom/Peak).")
+
+    steps.append("**30–90 Tage:** Charger-Plan (Anzahl/Leistung/Redundanz) + CAPEX/OPEX inkl. Förderungen/Netzkosten grob rechnen.")
+    return steps

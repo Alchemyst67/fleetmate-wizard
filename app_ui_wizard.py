@@ -75,6 +75,13 @@ TOU_PRICE_EUR_PER_KWH = [
     0.23, 0.26, 0.30, 0.33, 0.31, 0.28, 0.24, 0.22
 ]
 
+# ---- Dynamic pricing: fixed country averages (€/MWh), NOT from upload ----
+DYNAMIC_AVG_PRICE_EUR_PER_MWH = {
+    "DE": 86.79,  # Germany average (current default) for 2025
+    "AT": 86.79,  # TODO: set Austria average
+    "EU": 86.79,  # TODO: set EU average
+}
+
 
 def compute_flags_and_shares(start_hour: int, end_hour: int):
     """Return 24 hourly flags + shares (1 inside the window)."""
@@ -360,6 +367,10 @@ DEFAULT_INPUTS = dict(
     # Electricity
     price_mode="fixed",           # "fixed" | "dynamic"
     fixed_elec_price_mwh=86.79,   # used when price_mode=fixed
+
+    # NEW: only used when price_mode="dynamic"
+    dynamic_price_region="DE",
+
     # Internals (computed):
     avg_elec_price_mwh=86.79,     # gets set to fixed price or last-year spot average
     dynamic_share=0.0,            # 0=fixed, 1=dynamic
@@ -425,7 +436,6 @@ def ensure_defaults():
         "df": None,
         "timestamp_col": None,
         "consumption_col": None,
-        "price_col": None,
         "meta": {},
         "metrics": {},
     })
@@ -496,31 +506,34 @@ def derive_soc_from_km(inputs: dict) -> dict:
     }
 
 
-def apply_pricing_mode(inputs: dict, spot_metrics: dict | None) -> dict:
+def apply_pricing_mode(inputs: dict) -> dict:
     """
     Map price_mode -> internal avg_elec_price_mwh + dynamic_share.
 
-    - fixed: user enters fixed_elec_price_mwh, dynamic_share=0.0, avg_elec_price_mwh=fixed
-    - dynamic: avg_elec_price_mwh = last-year spot average from upload (if available),
-               dynamic_share=1.0
-               If no spot data, fall back to fixed_elec_price_mwh but keep dynamic_share=1.0
-               (and the model will use TOU as a rough proxy).
+    - fixed:
+        - avg_elec_price_mwh = fixed_elec_price_mwh
+        - dynamic_share = 0.0
+    - dynamic:
+        - avg_elec_price_mwh = fixed country average (AT/DE/EU), NOT from upload
+        - dynamic_share = 1.0 (TOU weighting via TOU_PRICE_EUR_PER_KWH)
     """
     mode = str(inputs.get("price_mode", "fixed")).strip().lower()
     fixed_mwh = float(max(0.0, inputs.get("fixed_elec_price_mwh", 0.0)))
 
     if mode == "dynamic":
         inputs["dynamic_share"] = 1.0
-        if spot_metrics and spot_metrics.get("spot_day_avg_eur_per_mwh") is not None:
-            inputs["avg_elec_price_mwh"] = float(max(0.0, spot_metrics["spot_day_avg_eur_per_mwh"]))
-        else:
-            inputs["avg_elec_price_mwh"] = fixed_mwh  # fallback
+        region = str(inputs.get("dynamic_price_region", "DE")).strip().upper()
+        if region not in DYNAMIC_AVG_PRICE_EUR_PER_MWH:
+            region = "DE"
+        inputs["dynamic_price_region"] = region
+        inputs["avg_elec_price_mwh"] = float(DYNAMIC_AVG_PRICE_EUR_PER_MWH[region])
     else:
         inputs["price_mode"] = "fixed"
         inputs["dynamic_share"] = 0.0
         inputs["avg_elec_price_mwh"] = fixed_mwh
 
     return inputs
+
 
 
 # =========================================================
@@ -568,15 +581,6 @@ def _guess_consumption_col(df: pd.DataFrame) -> str | None:
     return None
 
 
-def _guess_price_col(df: pd.DataFrame) -> str | None:
-    # Optional (only used in dynamic price mode)
-    for c in df.columns:
-        cl = str(c).lower()
-        if "price" in cl:
-            return c
-    return None
-
-
 def parse_uploaded_csv(upload) -> pd.DataFrame | None:
     """Parse uploaded CSV with best-effort delimiter and date parsing."""
     if upload is None:
@@ -607,7 +611,6 @@ def compute_profile_metrics(
     df_raw: pd.DataFrame,
     timestamp_col: str,
     consumption_col: str,
-    price_col: str | None,
     start_h: int,
     end_h: int,
 ) -> dict:
@@ -652,33 +655,6 @@ def compute_profile_metrics(
         "spot_window_avg_eur_per_kwh": None,
         "spot_curve_avg_eur_per_kwh": None,
     }
-
-    if price_col:
-        pr = pd.to_numeric(df[price_col], errors="coerce")
-        df["price_raw"] = pr
-        df = df.loc[df["price_raw"].notna()].copy()
-
-        # Heuristic for units:
-        # - if values typically > 5 => likely €/MWh (e.g., -30..100), convert to €/kWh by /1000
-        # - else likely already €/kWh
-        median_abs = float(np.nanmedian(np.abs(df["price_raw"].values))) if len(df) else 0.0
-        if median_abs > 5.0:
-            df["price_eur_per_kwh"] = df["price_raw"] / 1000.0
-        else:
-            df["price_eur_per_kwh"] = df["price_raw"]
-
-        ph = df.groupby("hour")["price_eur_per_kwh"].mean().reindex(range(24))
-        ph = ph.fillna(method="ffill").fillna(method="bfill")
-        spot_curve_avg = float(df["price_eur_per_kwh"].mean()) if len(df) else None
-        spot_window_avg = float(df.loc[df["in_window"], "price_eur_per_kwh"].mean()) if df["in_window"].any() else spot_curve_avg
-
-        out.update({
-            "has_price": True,
-            "spot_hourly_avg_eur_per_kwh": [float(x) for x in ph.values],
-            "spot_curve_avg_eur_per_kwh": spot_curve_avg,
-            "spot_window_avg_eur_per_kwh": spot_window_avg,
-            "spot_day_avg_eur_per_mwh": (spot_curve_avg * 1000.0) if spot_curve_avg is not None else None,
-        })
 
     return out
 
@@ -763,7 +739,7 @@ def recalc_from_inputs():
     inp["target_soc"] = derived["target_soc"]
 
     # ---- Pricing mode mapping (fixed vs dynamic) ----
-    inp = apply_pricing_mode(inp, prof_metrics if prof_metrics else None)
+    inp = apply_pricing_mode(inp)
 
     # ---- Existing site peak: prefer upload peak in charging window (if present) ----
     existing_peak_kw = float(inp.get("existing_peak_kw", 0.0))
@@ -772,9 +748,10 @@ def recalc_from_inputs():
         existing_peak_kw = float(max(0.0, prof_metrics["peak_kw_in_window"]))
         site_peak_source = "load_profile"
 
-    # Spot stats (for dynamic price weighting)
-    spot_curve_avg = prof_metrics.get("spot_curve_avg_eur_per_kwh") if prof_metrics else None
-    spot_window_avg = prof_metrics.get("spot_window_avg_eur_per_kwh") if prof_metrics else None
+    # Spot stats are intentionally disabled (dynamic pricing uses fixed averages + TOU curve)
+    spot_curve_avg = None
+    spot_window_avg = None
+
 
     inp["charging_window_hours"] = float(window_len_hours(int(inp["start_hour"]), int(inp["end_hour"])))
 
@@ -865,10 +842,6 @@ def recalc_from_inputs():
         "max_trucks_simultaneous_at_full_power": max_trucks_simultaneous,
         "recommended_avg_kw_per_truck": float(recommended_kw_per_truck) if recommended_kw_per_truck is not None else None,
     })
-
-    # ---- For charts: override TOU with real hourly spot averages if available ----
-    if prof_metrics and prof_metrics.get("spot_hourly_avg_eur_per_kwh") is not None:
-        res["charging_profile"]["tou_price_eur_per_kwh"] = prof_metrics["spot_hourly_avg_eur_per_kwh"]
 
     st.session_state["model_results"] = res
 
@@ -1343,7 +1316,6 @@ def reset_all():
         "df": None,
         "timestamp_col": None,
         "consumption_col": None,
-        "price_col": None,
         "meta": {},
         "metrics": {},
     }
@@ -1793,6 +1765,16 @@ def chart_note(lines: list[str], metrics: dict[str, str] | None = None, expanded
             for i, (k, v) in enumerate(metrics.items()):
                 cols[i % len(cols)].metric(k, v)
 
+def _inputs_digest_for_tornado(inp: dict) -> str:
+    # only include what affects results materially
+    keys = [
+        "num_trucks","operating_days","events_per_truck","battery_kwh","ev_consumption",
+        "km_per_truck_per_day","avg_elec_price_mwh","dynamic_share",
+        "start_hour","end_hour","existing_peak_kw","charger_power_kw","site_capacity_kva",
+        "diesel_price","diesel_l_per_100","toll_rate","tolled_share","ev_toll_exempt",
+    ]
+    payload = {k: inp.get(k) for k in keys}
+    return hashlib.md5(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
 
 
 # =========================================================
@@ -2291,18 +2273,17 @@ with left:
                         help=("Standard: Germany average 86.79 €/MWh" if lang == "EN" else "Standard: Deutscher Durchschnitt 86,79 €/MWh")
                     )
                 else:
-                    st.info(
-                        ("Dynamic mode: Upload a load profile CSV that also contains spot prices "
-                         "(e.g., a 'da_price' column). If no price column is present, we fall back to your fixed price.")
-                        if lang == "EN" else
-                        ("Dynamisch: Lade ein Lastprofil-CSV hoch, das auch Spotpreise enthält "
-                         "(z. B. Spalte 'da_price'). Fehlt die Preisspalte, wird dein Fixpreis als Fallback genutzt.")
+                    bind_select(
+                        sid, "dynamic_price_region",
+                        "Dynamic price region" if lang == "EN" else "Dynamic-Preis Region",
+                        options=["AT", "DE", "EU"],
+                        help=("Uses a fixed national average (€/MWh) + TOU weighting in the charging window." if lang == "EN"
+                            else "Nutzt einen fixen Länder-Durchschnitt (€/MWh) + TOU-Gewichtung im Ladefenster.")
                     )
-                    bind_number(
-                        sid, "fixed_elec_price_mwh",
-                        "Fallback price if no spot data (86.79 €/MWh)" if lang == "EN" else "Fallback-Preis falls keine Spotdaten (86,79 €/MWh)",
-                        min_value=0.0, max_value=2000.0, step=10.0,
-                    )
+                    r = str(get_inp("dynamic_price_region")).upper()
+                    v = DYNAMIC_AVG_PRICE_EUR_PER_MWH.get(r, DYNAMIC_AVG_PRICE_EUR_PER_MWH["DE"])
+                    st.metric("Applied average (€/MWh)" if lang == "EN" else "Verwendeter Durchschnitt (€/MWh)", f"{v:,.2f}")
+
 
                 gs_hr()
 
@@ -2354,7 +2335,6 @@ with left:
                         if df_raw is not None and not df_raw.empty:
                             cache["timestamp_col"] = _guess_timestamp_col(df_raw)
                             cache["consumption_col"] = _guess_consumption_col(df_raw)
-                            cache["price_col"] = _guess_price_col(df_raw)
 
                     df_raw = cache.get("df")
                     if df_raw is None or df_raw.empty:
@@ -2378,26 +2358,15 @@ with left:
                                 index=cols.index(cache["consumption_col"]) if cache.get("consumption_col") in cols else 0,
                                 key="cons_col_select",
                             )
-                        with cC:
-                            price_opts = ["(none)"] + cols
-                            default_price = cache.get("price_col") if cache.get("price_col") in cols else "(none)"
-                            price_col = st.selectbox(
-                                "Price column (optional)" if lang == "EN" else "Preisspalte (optional)",
-                                options=price_opts,
-                                index=price_opts.index(default_price) if default_price in price_opts else 0,
-                                key="price_col_select",
-                            )
-                            price_col = None if price_col == "(none)" else price_col
 
                         cache["timestamp_col"] = ts_col
                         cache["consumption_col"] = cons_col
-                        cache["price_col"] = price_col
 
                         # Compute metrics using current charging window
                         start_h = int(get_inp("start_hour")) % 24
                         end_h = int(get_inp("end_hour")) % 24
                         try:
-                            metrics = compute_profile_metrics(df_raw, ts_col, cons_col, price_col, start_h, end_h)
+                            metrics = compute_profile_metrics(df_raw, ts_col, cons_col, start_h, end_h)
                             cache["metrics"] = metrics
                         except Exception:
                             cache["metrics"] = {}
@@ -2896,114 +2865,212 @@ with left:
                     st.json(res)
 
             with tabs[4]:
+                st.subheader("Tornado / Sensitivitätsanalyse (ceteris paribus)")
 
-                if st.button("Run tornado", use_container_width=True, key="run_tornado_btn"):
-                    with st.spinner("Running tornado…"):
+                # ---------------------------------------------------------
+                # 1) Results holen (gekoppelt an session_state["model_results"])
+                # ---------------------------------------------------------
+                res2 = st.session_state.get("model_results")
+                if not res2:
+                    st.info("Noch keine Model-Results vorhanden. Bitte zuerst den Fragebogen ausfüllen.")
+                    st.stop()
+
+                base = (res2.get("inputs") or {}).copy()
+                if not base:
+                    st.error("`model_results['inputs']` fehlt oder ist leer. Tornado braucht die run_model()-Parameter.")
+                    st.stop()
+
+                # Basis-Savings
+                try:
+                    base_savings = float(res2["diesel_vs_ev"]["total_savings_incl_toll_eur"])
+                except Exception:
+                    st.error("Basis-Ersparnis fehlt: `diesel_vs_ev.total_savings_incl_toll_eur`.")
+                    st.stop()
+
+                # Spot-Infos (falls jemals aktiv) konsistent mitgeben
+                pdets = (res2.get("energy_cost", {}) or {}).get("price_details", {}) or {}
+                used_spot = bool(pdets.get("used_spot_data", False))
+                spot_curve_avg = pdets.get("curve_avg_eur_per_kwh", None) if used_spot else None
+                spot_window_avg = pdets.get("window_avg_eur_per_kwh", None) if used_spot else None
+
+                # ---------------------------------------------------------
+                # 2) Parameter-Setup
+                # ---------------------------------------------------------
+                # Default-Fraktionen: bewusst pragmatisch
+                params = [
+                    ("Electricity price (€/MWh)", "avg_elec_price_eur_per_mwh", 0.20),
+                    ("Diesel price (€/L)", "diesel_price_eur_per_l", 0.15),
+                    ("EV consumption (kWh/km)", "ev_consumption_kwh_per_km", 0.15),
+                    ("Diesel L/100km", "diesel_l_per_100km", 0.15),
+                    ("Events / truck / day", "events_per_truck_per_day", 0.20),
+                    ("Tolled share", "tolled_share_0_1", 0.20),
+                    ("Toll rate (€/km)", "toll_rate_eur_per_km", 0.20),
+                ]
+
+                missing = [k for _, k, _ in params if k not in base]
+                if missing:
+                    st.error(
+                        "Tornado kann nicht laufen, weil diese Keys in `model_results['inputs']` fehlen:\n"
+                        + ", ".join(missing)
+                        + "\n\nAchtung: Tornado erwartet run_model()-Keys, nicht UI-Keys."
+                    )
+                    st.stop()
+
+                # ---------------------------------------------------------
+                # 3) Helpers (Clamp + sichere Defaults)
+                # ---------------------------------------------------------
+                ABS_FLOOR = {
+                    "diesel_price_eur_per_l": 0.05,
+                    "avg_elec_price_eur_per_mwh": 5.0,
+                    "ev_consumption_kwh_per_km": 0.02,
+                    "diesel_l_per_100km": 0.5,
+                    "events_per_truck_per_day": 0.25,
+                    "tolled_share_0_1": 0.01,
+                    "toll_rate_eur_per_km": 0.01,
+                }
+
+                def _clamp_value(key: str, v):
+                    # numerisch erzwingen
+                    try:
+                        v = float(v)
+                    except Exception:
+                        v = float(ABS_FLOOR.get(key, 0.0))
+
+                    # Clamp je nach Typ
+                    if key == "tolled_share_0_1":
+                        v = min(max(v, 0.0), 1.0)
+                    elif key == "events_per_truck_per_day":
+                        v = max(v, 0.0)
+                    else:
+                        v = max(v, 0.0)
+
+                    # Floors
+                    if v <= 0 and key in ABS_FLOOR:
+                        v = float(ABS_FLOOR[key])
+                    return v
+
+                def _run_savings(overrides: dict) -> float:
+                    kw = base.copy()
+                    kw.update(overrides)
+
+                    r = run_model(
+                        **kw,
+                        spot_curve_avg_eur_per_kwh=spot_curve_avg,
+                        spot_window_avg_eur_per_kwh=spot_window_avg,
+                    )
+                    return float(r["diesel_vs_ev"]["total_savings_incl_toll_eur"])
+
+                # ---------------------------------------------------------
+                # 4) Cache (kein Button) – nur neu rechnen wenn Inputs sich ändern
+                # ---------------------------------------------------------
+                digest = _inputs_digest_for_tornado(st.session_state["inputs"])
+                cache_key = "tornado_cache"
+
+                if (cache_key in st.session_state) and (st.session_state[cache_key].get("digest") == digest):
+                    df_tornado = st.session_state[cache_key]["df"]
+                    base_savings_cached = st.session_state[cache_key]["base_savings"]
+                else:
+                    rows = []
+                    for label, key, frac in params:
+                        base_val = _clamp_value(key, base.get(key, 0.0))
+
+                        low = _clamp_value(key, base_val * (1.0 - frac))
+                        high = _clamp_value(key, base_val * (1.0 + frac))
+
+                        # Wenn base_val ≈ 0: nutze Floor als "base" und skaliere davon
+                        if float(base.get(key, 0.0)) == 0.0 and key in ABS_FLOOR:
+                            base_val = float(ABS_FLOOR[key])
+                            low = _clamp_value(key, base_val * (1.0 - frac))
+                            high = _clamp_value(key, base_val * (1.0 + frac))
+
                         try:
-                            res2 = st.session_state.get("model_results")
-                            if not res2:
-                                st.error("No model results available.")
-                                st.stop()
-
-                            base = res2["inputs"].copy()  # <- WICHTIG: das sind exakt die run_model() Parameter
-                            base_savings = float(res2["diesel_vs_ev"]["total_savings_incl_toll_eur"])
-
-                            # Spot-Infos mitgeben (falls vorhanden), damit Tornado konsistent zum aktuellen Run bleibt
-                            prof = res2.get("profile", {}) or {}
-                            spot_curve = prof.get("spot_curve_avg_eur_per_kwh", None)
-                            spot_window = prof.get("spot_window_avg_eur_per_kwh", None)
-
-                            params = [
-                                ("Electricity price (€/MWh)", "avg_elec_price_eur_per_mwh", 0.20),
-                                ("Diesel price (€/L)", "diesel_price_eur_per_l", 0.15),
-                                ("EV consumption (kWh/km)", "ev_consumption_kwh_per_km", 0.15),
-                                ("Diesel L/100km", "diesel_l_per_100km", 0.15),
-                                ("Events / truck / day", "events_per_truck_per_day", 0.20),
-                                ("Tolled share", "tolled_share_0_1", 0.20),
-                                ("Toll rate (€/km)", "toll_rate_eur_per_km", 0.20),
-                            ]
-
-                            missing = [k for _, k, _ in params if k not in base]
-                            if missing:
-                                st.error(
-                                    "Tornado kann nicht laufen, weil diese Keys im `res['inputs']` fehlen:\n"
-                                    + ", ".join(missing)
-                                    + "\n\nDas passiert, wenn du irgendwo auf UI-Keys umgestellt hast (z.B. `site_capacity_kva`) "
-                                    "und Tornado noch `run_model`-Keys erwartet."
-                                )
-                                st.stop()
-
-                            def clamp(k, v):
-                                v = float(v)
-                                if k in ("start_soc", "target_soc", "dynamic_price_share", "tolled_share_0_1"):
-                                    return float(min(max(v, 0.0), 1.0))
-                                return float(max(v, 0.0))
-
-                            impacts = []
-                            for label, key, pct in params:
-                                lo = base.copy()
-                                hi = base.copy()
-
-                                lo[key] = clamp(key, float(base[key]) * (1 - pct))
-                                hi[key] = clamp(key, float(base[key]) * (1 + pct))
-
-                                r_lo = run_model(
-                                    **lo,
-                                    spot_curve_avg_eur_per_kwh=spot_curve,
-                                    spot_window_avg_eur_per_kwh=spot_window,
-                                )
-                                r_hi = run_model(
-                                    **hi,
-                                    spot_curve_avg_eur_per_kwh=spot_curve,
-                                    spot_window_avg_eur_per_kwh=spot_window,
-                                )
-
-                                s_lo = float(r_lo["diesel_vs_ev"]["total_savings_incl_toll_eur"]) - base_savings
-                                s_hi = float(r_hi["diesel_vs_ev"]["total_savings_incl_toll_eur"]) - base_savings
-                                impacts.append((label, s_lo, s_hi))
-
-                            df_imp = pd.DataFrame(impacts, columns=["Parameter", "Delta_low", "Delta_high"])
-                            df_imp["Range"] = (df_imp["Delta_high"] - df_imp["Delta_low"]).abs()
-                            df_imp = df_imp.sort_values("Range", ascending=False)
-
-                            fig, ax = plt.subplots(figsize=(9, 5))
-                            y = np.arange(len(df_imp))
-                            left = df_imp[["Delta_low", "Delta_high"]].min(axis=1)
-                            right = df_imp[["Delta_low", "Delta_high"]].max(axis=1)
-                            ax.barh(y, right - left, left=left)
-                            ax.axvline(0, linestyle="--", alpha=0.5)
-                            ax.set_yticks(y)
-                            ax.set_yticklabels(df_imp["Parameter"])
-                            ax.set_xlabel("Impact on total savings (€/year)")
-                            ax.grid(True, axis="x", alpha=0.2)
-                            fig.tight_layout()
-
-                            st.pyplot(fig, use_container_width=True)
-                            st.dataframe(df_imp, use_container_width=True, hide_index=True)
-                            chart_note(
-                                lines=[
-                                    "Tornado = **Einfluss einzelner Parameter** auf die Netto-Ersparnis (jeweils ceteris paribus).",
-                                    "Breiter Balken = hoher Hebel → hier lohnt sich Datenqualität/Vertrag/Optimierung am meisten."
-                                ],
-                                metrics={
-                                    "Top-Hebel #1": str(df_imp.iloc[0]["Parameter"]) if len(df_imp) else "—",
-                                    "Spannweite #1": f"{float(df_imp.iloc[0]['Range']):,.0f} €/Jahr" if len(df_imp) else "—",
-                                    "Basis-Ersparnis": fmt_eur(base_savings),
-                                },
-                                expanded=True
-                            )
-
-
-                                                        # für spätere Nutzung (z.B. Export/Debug) speichern
-                            st.session_state["tornado_df"] = df_imp
-
-                            with st.expander("Was bedeutet das?", expanded=True):
-                                st.markdown(tornado_takeaways(df_imp))
-
-
-
+                            s_low = _run_savings({key: low})
+                            s_high = _run_savings({key: high})
                         except Exception as e:
-                            st.exception(e)
+                            s_low = np.nan
+                            s_high = np.nan
+
+                        d_low = s_low - base_savings if np.isfinite(s_low) else np.nan
+                        d_high = s_high - base_savings if np.isfinite(s_high) else np.nan
+
+                        # Range = Spannweite, robust gegen Reihenfolge
+                        if np.isfinite(d_low) and np.isfinite(d_high):
+                            rng = float(abs(d_high - d_low))
+                            lo = float(min(d_low, d_high))
+                            hi = float(max(d_low, d_high))
+                        else:
+                            rng, lo, hi = np.nan, np.nan, np.nan
+
+                        rows.append({
+                            "Parameter": label,
+                            "Key": key,
+                            "Base": base_val,
+                            "Low": low,
+                            "High": high,
+                            "Savings_base": base_savings,
+                            "Savings_low": s_low,
+                            "Savings_high": s_high,
+                            "Delta_low": d_low,
+                            "Delta_high": d_high,
+                            "Lo": lo,
+                            "Hi": hi,
+                            "Range": rng,
+                        })
+
+                    df_tornado = pd.DataFrame(rows)
+                    st.session_state[cache_key] = {"digest": digest, "df": df_tornado, "base_savings": base_savings}
+                    base_savings_cached = base_savings
+
+                # ---------------------------------------------------------
+                # 5) Output: KPIs + Chart + Tabelle + Takeaways
+                # ---------------------------------------------------------
+                c1, c2, c3 = st.columns(3)
+                with c1:
+                    st.metric("Basis-Ersparnis (inkl. Maut)" if st.session_state["lang"] == "DE" else "Base savings (incl. toll)", fmt_eur(base_savings_cached))
+                with c2:
+                    st.metric("Preis-Modus" if st.session_state["lang"] == "DE" else "Price mode",
+                            "Spot (Upload)" if used_spot else ("Dynamic (TOU)" if float(base.get("dynamic_price_share", 0.0)) >= 0.5 else "Fixed"))
+                with c3:
+                    st.metric("Parameter getestet" if st.session_state["lang"] == "DE" else "Params tested", f"{len(df_tornado)}")
+
+                # Sortiert nach Einfluss
+                dfp = df_tornado.copy()
+                dfp = dfp.replace([np.inf, -np.inf], np.nan)
+                dfp = dfp.loc[dfp["Range"].notna()].sort_values("Range", ascending=False)
+
+                if dfp.empty:
+                    st.warning("Tornado nicht verfügbar (keine gültigen Läufe).")
+                    st.dataframe(df_tornado, use_container_width=True, hide_index=True)
+                    st.stop()
+
+                # Tornado Plot (ohne Farben festzunageln)
+                fig, ax = plt.subplots(figsize=(9, 5))
+                y = np.arange(len(dfp))
+                widths = (dfp["Hi"] - dfp["Lo"]).to_numpy()
+                lefts = dfp["Lo"].to_numpy()
+
+                ax.barh(y, widths, left=lefts)
+                ax.axvline(0.0, linestyle="--", alpha=0.4)
+                ax.set_yticks(y)
+                ax.set_yticklabels(dfp["Parameter"].tolist())
+                ax.set_xlabel("Δ Savings vs Base (€/year)" if st.session_state["lang"] == "EN" else "Δ Ersparnis vs Basis (€/Jahr)")
+                ax.grid(True, axis="x", alpha=0.2)
+                fig.tight_layout()
+                st.pyplot(fig, use_container_width=True)
+
+                # Kurzerklärung + Top-Takeaways
+                st.markdown("#### Interpretation" if st.session_state["lang"] == "DE" else "#### Interpretation")
+                st.markdown(
+                    tornado_takeaways(dfp, top_n=min(3, len(dfp)))
+                )
+
+                # Tabelle (kompakt)
+                show_cols = ["Parameter", "Base", "Low", "High", "Savings_low", "Savings_high", "Delta_low", "Delta_high", "Range"]
+                st.dataframe(dfp[show_cols], use_container_width=True, hide_index=True)
+
+                with st.expander("Debug: run_model base inputs", expanded=False):
+                    st.json(base)
+
 
 
             with tabs[5]:

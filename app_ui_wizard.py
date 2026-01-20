@@ -455,6 +455,12 @@ def run_model(
             "grid_eur_per_kwh": grid_eur_per_kwh,
             "levies_eur_per_kwh": levies_eur_per_kwh,
             "vat_percent": vat_percent,
+            "num_chargers": num_chargers,
+            "power_factor": power_factor,
+            "existing_site_avg_kw_in_window": existing_site_avg_kw_in_window,
+            "baseline_site_peak_kw_overall": baseline_site_peak_kw_overall,
+            "net_demand_eur_per_kw_year": net_demand_eur_per_kw_year,
+
         },
         "charging_profile": {
             "flags": flags,
@@ -1168,6 +1174,26 @@ def recalc_from_inputs():
     4) Attach capacity analysis to results (customer-friendly reverse calculation)
     """
     inp = st.session_state["inputs"]
+
+    pc = st.session_state.get("profile_cache", {}) or {}
+    df = pc.get("df")
+    ts_col = pc.get("timestamp_col")
+    cons_col = pc.get("consumption_col")
+
+    if df is not None and ts_col and cons_col:
+        start_h = int(st.session_state["inputs"].get("start_hour", 22)) % 24
+        end_h   = int(st.session_state["inputs"].get("end_hour", 6)) % 24
+
+        mdig = f"{pc.get('digest')}|{start_h}|{end_h}|v1"
+        if pc.get("metrics_digest") != mdig:
+            try:
+                pc["metrics"] = compute_profile_metrics(df, ts_col, cons_col, start_h, end_h)
+                pc["metrics_digest"] = mdig
+                st.session_state["profile_cache"] = pc
+            except Exception:
+                # keep last good metrics; don't overwrite with {}
+                pass
+
     # existing_peak_kw nur überschreiben, wenn ein Lastprofil da ist (das machst du unten ohnehin).
 
     # ---- Load profile (if any) ----
@@ -2704,6 +2730,189 @@ def tornado_takeaways(df, top_n=3):
         )
     out.append("- Das ist **ceteris paribus**: jeweils nur **ein** Parameter wird verändert.")
     return "\n".join(out)
+
+def render_tornado_tab():
+    st.subheader("Tornado / Sensitivitätsanalyse (ceteris paribus)")
+
+    res2 = st.session_state.get("model_results")
+    if not res2:
+        st.info("Noch keine Model-Results vorhanden. Bitte zuerst den Fragebogen ausfüllen.")
+        return
+
+    base = (res2.get("inputs") or {}).copy()
+    if not base:
+        st.error("`model_results['inputs']` fehlt oder ist leer. Tornado braucht die run_model()-Parameter.")
+        return
+
+    required = [
+        "num_chargers",
+        "power_factor",
+        "existing_site_avg_kw_in_window",
+        "baseline_site_peak_kw_overall",
+        "net_demand_eur_per_kw_year",
+    ]
+    missing_req = [k for k in required if k not in base]
+    if missing_req:
+        st.error("Tornado kann nicht laufen, weil Pflicht-Keys in model_results['inputs'] fehlen: " + ", ".join(missing_req)
+                + "\nBitte Model-Run neu erzeugen (Fragebogen neu starten).")
+        st.stop()
+
+
+    try:
+        base_savings = float(res2["diesel_vs_ev"]["total_savings_incl_toll_eur"])
+    except Exception:
+        st.error("Basis-Ersparnis fehlt: `diesel_vs_ev.total_savings_incl_toll_eur`.")
+        return
+
+    pdets = (res2.get("energy_cost", {}) or {}).get("price_details", {}) or {}
+    used_spot = bool(pdets.get("used_spot_data", False))
+    spot_curve_avg = pdets.get("curve_avg_eur_per_kwh", None) if used_spot else None
+    spot_window_avg = pdets.get("window_avg_eur_per_kwh", None) if used_spot else None
+
+    params = [
+        ("Electricity price (€/MWh)", "avg_elec_price_eur_per_mwh", 0.20),
+        ("Diesel price (€/L)", "diesel_price_eur_per_l", 0.15),
+        ("EV consumption (kWh/km)", "ev_consumption_kwh_per_km", 0.15),
+        ("Diesel L/100km", "diesel_l_per_100km", 0.15),
+        ("Events / truck / day", "km_per_truck_per_day", 0.20),
+        ("Tolled share", "tolled_share_0_1", 0.20),
+        ("Toll rate (€/km)", "toll_rate_eur_per_km", 0.20),
+    ]
+
+    missing = [k for _, k, _ in params if k not in base]
+    if missing:
+        st.error(
+            "Tornado kann nicht laufen, weil diese Keys in `model_results['inputs']` fehlen:\n"
+            + ", ".join(missing)
+            + "\n\nAchtung: Tornado erwartet run_model()-Keys, nicht UI-Keys."
+        )
+        return
+
+    ABS_FLOOR = {
+        "diesel_price_eur_per_l": 0.05,
+        "avg_elec_price_eur_per_mwh": 5.0,
+        "ev_consumption_kwh_per_km": 0.02,
+        "diesel_l_per_100km": 0.5,
+        "km_per_truck_per_day": 0.25,
+        "tolled_share_0_1": 0.01,
+        "toll_rate_eur_per_km": 0.01,
+    }
+
+    def _clamp_value(key: str, v):
+        try:
+            v = float(v)
+        except Exception:
+            v = float(ABS_FLOOR.get(key, 0.0))
+
+        if key == "tolled_share_0_1":
+            v = min(max(v, 0.0), 1.0)
+        else:
+            v = max(v, 0.0)
+
+        if v <= 0 and key in ABS_FLOOR:
+            v = float(ABS_FLOOR[key])
+        return v
+
+    def _run_savings(overrides: dict) -> float:
+        kw = base.copy()
+        kw.update(overrides)
+        r = run_model(
+            **kw,
+            spot_curve_avg_eur_per_kwh=spot_curve_avg,
+            spot_window_avg_eur_per_kwh=spot_window_avg,
+        )
+        return float(r["diesel_vs_ev"]["total_savings_incl_toll_eur"])
+
+    # Cache digest: NIE direkt st.session_state["inputs"] verwenden (KeyError killt alles)
+    inputs_for_digest = st.session_state.get("inputs") or {}
+    TORNADO_CACHE_VERSION = 2
+    digest = f"{_inputs_digest_for_tornado(st.session_state['inputs'])}|v{TORNADO_CACHE_VERSION}"
+
+
+    cache_key = "tornado_cache"
+    if (cache_key in st.session_state) and (st.session_state[cache_key].get("digest") == digest):
+        df_tornado = st.session_state[cache_key]["df"]
+        base_savings_cached = st.session_state[cache_key]["base_savings"]
+    else:
+        rows = []
+        for label, key, frac in params:
+            base_val = _clamp_value(key, base.get(key, 0.0))
+            low = _clamp_value(key, base_val * (1.0 - frac))
+            high = _clamp_value(key, base_val * (1.0 + frac))
+
+            if float(base.get(key, 0.0)) == 0.0 and key in ABS_FLOOR:
+                base_val = float(ABS_FLOOR[key])
+                low = _clamp_value(key, base_val * (1.0 - frac))
+                high = _clamp_value(key, base_val * (1.0 + frac))
+
+            try:
+                s_low = _run_savings({key: low})
+                s_high = _run_savings({key: high})
+            except Exception:
+                s_low = np.nan
+                s_high = np.nan
+
+            d_low = s_low - base_savings if np.isfinite(s_low) else np.nan
+            d_high = s_high - base_savings if np.isfinite(s_high) else np.nan
+
+            if np.isfinite(d_low) and np.isfinite(d_high):
+                rng = float(abs(d_high - d_low))
+                lo = float(min(d_low, d_high))
+                hi = float(max(d_low, d_high))
+            else:
+                rng, lo, hi = np.nan, np.nan, np.nan
+
+            rows.append({
+                "Parameter": label, "Key": key,
+                "Base": base_val, "Low": low, "High": high,
+                "Savings_base": base_savings, "Savings_low": s_low, "Savings_high": s_high,
+                "Delta_low": d_low, "Delta_high": d_high,
+                "Lo": lo, "Hi": hi, "Range": rng,
+            })
+
+        df_tornado = pd.DataFrame(rows)
+        st.session_state[cache_key] = {"digest": digest, "df": df_tornado, "base_savings": base_savings}
+        base_savings_cached = base_savings
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.metric("Basis-Ersparnis (inkl. Maut)" if st.session_state.get("lang") == "DE" else "Base savings (incl. toll)", fmt_eur(base_savings_cached))
+    with c2:
+        st.metric("Preis-Modus" if st.session_state.get("lang") == "DE" else "Price mode",
+                  "Spot (Upload)" if used_spot else ("Dynamic (TOU)" if float(base.get("dynamic_price_share", 0.0)) >= 0.5 else "Fixed"))
+    with c3:
+        st.metric("Parameter getestet" if st.session_state.get("lang") == "DE" else "Params tested", f"{len(df_tornado)}")
+
+    dfp = df_tornado.replace([np.inf, -np.inf], np.nan)
+    dfp = dfp.loc[dfp["Range"].notna()].sort_values("Range", ascending=False)
+
+    if dfp.empty:
+        st.warning("Tornado nicht verfügbar (keine gültigen Läufe).")
+        st.dataframe(df_tornado, use_container_width=True, hide_index=True)
+        return
+
+    fig, ax = plt.subplots(figsize=(9, 5))
+    y = np.arange(len(dfp))
+    widths = (dfp["Hi"] - dfp["Lo"]).to_numpy()
+    lefts = dfp["Lo"].to_numpy()
+    ax.barh(y, widths, left=lefts)
+    ax.axvline(0.0, linestyle="--", alpha=0.4)
+    ax.set_yticks(y)
+    ax.set_yticklabels(dfp["Parameter"].tolist())
+    ax.set_xlabel("Δ Savings vs Base (€/year)" if st.session_state.get("lang") == "EN" else "Δ Ersparnis vs Basis (€/Jahr)")
+    ax.grid(True, axis="x", alpha=0.2)
+    fig.tight_layout()
+    st.pyplot(fig, use_container_width=True)
+
+    st.markdown("#### " + t("interpretation"))
+    st.markdown(tornado_takeaways(dfp, top_n=min(3, len(dfp))))
+
+    show_cols = ["Parameter", "Base", "Low", "High", "Savings_low", "Savings_high", "Delta_low", "Delta_high", "Range"]
+    st.dataframe(dfp[show_cols], use_container_width=True, hide_index=True)
+
+    with st.expander("Debug: run_model base inputs", expanded=False):
+        st.json(base)
+
 
 
 def fmt_eur_per_kwh(x):
@@ -4329,9 +4538,10 @@ with left:
                         st.session_state["profile_cache"] = cache
                         recalc_from_inputs()
                 else:
-                    st.session_state["profile_cache"]["digest"] = None
-                    st.session_state["profile_cache"]["df"] = None
-                    st.session_state["profile_cache"]["metrics"] = {}
+                    # Do NOT wipe cached profile automatically.
+                    # Streamlit can temporarily return None on reruns / conditional rendering.
+                    pass
+
 
                 gs_hr()
 
@@ -4684,8 +4894,31 @@ with left:
                 )
 
             with tabs[2]:
+
+
                 render_power_consumption_chart_streamlit(res, st)
                 render_energy_year_chart_streamlit(res, st)
+
+                
+                inp  = res.get("inputs", {})
+                load = res.get("load", {})
+                ec   = res.get("energy_cost", {})
+
+                # --- Chart A: Peak-Leistung (bestehend vs. neu) ---
+                existing_peak = float(inp.get("existing_site_peak_kw", 0.0))
+                added_charge  = float(load.get("total_charge_power_kw", 0.0))
+                new_peak      = float(load.get("new_theoretical_peak_kw", existing_peak + added_charge))
+                cap_kw        = float(load.get("site_capacity_kw", 0.0))
+
+                figA, axA = plt.subplots(figsize=(7.5, 4))
+                axA.bar(["Existing peak", "EV charging (added)", "New peak", "Site capacity"], [existing_peak, added_charge, new_peak, cap_kw])
+                axA.set_ylabel("kW")
+                axA.set_title("Peak power (kW)")
+                axA.grid(True, axis="y", alpha=0.2)
+                figA.tight_layout()
+                st.pyplot(figA, use_container_width=True)
+
+
                 dfh = build_hourly_df(res)
 
                 gs_hr()
@@ -4716,6 +4949,10 @@ with left:
 
                 m = st.session_state["profile_cache"]["metrics"]
 
+                m.setdefault("sampling_minutes_median", None)
+                m.setdefault("hourly_kwh_in_window_avg", [None] * 24)
+
+
                 c1, c2, c3, c4 = st.columns(4)
                 peak_global = float(m.get("peak_kw_overall", m.get("peak_kw_overall_kw", m.get("peak_kw", 0.0))))
                 peak_window = float(m.get("peak_kw_in_window", 0.0))
@@ -4725,7 +4962,14 @@ with left:
                 c1.metric("Peak gesamt (kW)", f"{peak_global:,.0f}")
                 c2.metric("Peak im Ladefenster (kW)", f"{peak_window:,.0f}")
                 c3.metric("Ø kWh/Tag im Ladefenster", f"{avg_kwh_day_window:,.0f}")
-                c4.metric("Sampling (Median)", f"{m['sampling_minutes_median']:.0f} min")
+                m = m or {}
+                v = m.get("sampling_minutes_median", None)
+
+                if v is None:
+                    c4.metric("Sampling (Median)", "—")
+                else:
+                    c4.metric("Sampling (Median)", f"{float(v):.0f} min")
+
 
                 # Stunden im Ladefenster als Tabelle
                 sh = int(str(st.session_state["charge_window_start"]).split(":")[0]) % 24
@@ -4788,269 +5032,119 @@ with left:
 
 
             with tabs[3]:
-                df_calc = build_calculation_df(res)
-                st.dataframe(df_calc, use_container_width=True, hide_index=True)
+                try:
+                    df_calc = build_calculation_df(res)
+                    st.dataframe(df_calc, use_container_width=True, hide_index=True)
+                except Exception as e:
+                    st.error("Calculation table failed (build_calculation_df crashed).")
+                    st.exception(e)
 
                 with st.expander("Full model output (JSON)", expanded=False):
                     st.json(res)
 
+
             with tabs[4]:
-                st.subheader("Tornado / Sensitivitätsanalyse (ceteris paribus)")
-
-                # ---------------------------------------------------------
-                # 1) Results holen (gekoppelt an session_state["model_results"])
-                # ---------------------------------------------------------
-                res2 = st.session_state.get("model_results")
-                if not res2:
-                    st.info("Noch keine Model-Results vorhanden. Bitte zuerst den Fragebogen ausfüllen.")
-                    st.stop()
-
-                base = (res2.get("inputs") or {}).copy()
-                if not base:
-                    st.error("`model_results['inputs']` fehlt oder ist leer. Tornado braucht die run_model()-Parameter.")
-                    st.stop()
-
-                # Basis-Savings
-                try:
-                    base_savings = float(res2["diesel_vs_ev"]["total_savings_incl_toll_eur"])
-                except Exception:
-                    st.error("Basis-Ersparnis fehlt: `diesel_vs_ev.total_savings_incl_toll_eur`.")
-                    st.stop()
-
-                # Spot-Infos (falls jemals aktiv) konsistent mitgeben
-                pdets = (res2.get("energy_cost", {}) or {}).get("price_details", {}) or {}
-                used_spot = bool(pdets.get("used_spot_data", False))
-                spot_curve_avg = pdets.get("curve_avg_eur_per_kwh", None) if used_spot else None
-                spot_window_avg = pdets.get("window_avg_eur_per_kwh", None) if used_spot else None
-
-                # ---------------------------------------------------------
-                # 2) Parameter-Setup
-                # ---------------------------------------------------------
-                # Default-Fraktionen: bewusst pragmatisch
-                params = [
-                    ("Electricity price (€/MWh)", "avg_elec_price_eur_per_mwh", 0.20),
-                    ("Diesel price (€/L)", "diesel_price_eur_per_l", 0.15),
-                    ("EV consumption (kWh/km)", "ev_consumption_kwh_per_km", 0.15),
-                    ("Diesel L/100km", "diesel_l_per_100km", 0.15),
-                    ("Events / truck / day", "km_per_truck_per_day", 0.20),
-                    ("Tolled share", "tolled_share_0_1", 0.20),
-                    ("Toll rate (€/km)", "toll_rate_eur_per_km", 0.20),
-                ]
-
-                missing = [k for _, k, _ in params if k not in base]
-                if missing:
-                    st.error(
-                        "Tornado kann nicht laufen, weil diese Keys in `model_results['inputs']` fehlen:\n"
-                        + ", ".join(missing)
-                        + "\n\nAchtung: Tornado erwartet run_model()-Keys, nicht UI-Keys."
-                    )
-                    st.stop()
-
-                # ---------------------------------------------------------
-                # 3) Helpers (Clamp + sichere Defaults)
-                # ---------------------------------------------------------
-                ABS_FLOOR = {
-                    "diesel_price_eur_per_l": 0.05,
-                    "avg_elec_price_eur_per_mwh": 5.0,
-                    "ev_consumption_kwh_per_km": 0.02,
-                    "diesel_l_per_100km": 0.5,
-                    "km_per_truck_per_day": 0.25,
-                    "tolled_share_0_1": 0.01,
-                    "toll_rate_eur_per_km": 0.01,
-                }
-
-                def _clamp_value(key: str, v):
-                    # numerisch erzwingen
-                    try:
-                        v = float(v)
-                    except Exception:
-                        v = float(ABS_FLOOR.get(key, 0.0))
-
-                    # Clamp je nach Typ
-                    if key == "tolled_share_0_1":
-                        v = min(max(v, 0.0), 1.0)
-                    elif key == "km_per_truck_per_day":
-                        v = max(v, 0.0)
-                    else:
-                        v = max(v, 0.0)
-
-                    # Floors
-                    if v <= 0 and key in ABS_FLOOR:
-                        v = float(ABS_FLOOR[key])
-                    return v
-
-                def _run_savings(overrides: dict) -> float:
-                    kw = base.copy()
-                    kw.update(overrides)
-
-                    r = run_model(
-                        **kw,
-                        spot_curve_avg_eur_per_kwh=spot_curve_avg,
-                        spot_window_avg_eur_per_kwh=spot_window_avg,
-                    )
-                    return float(r["diesel_vs_ev"]["total_savings_incl_toll_eur"])
-
-                # ---------------------------------------------------------
-                # 4) Cache (kein Button) – nur neu rechnen wenn Inputs sich ändern
-                # ---------------------------------------------------------
-                digest = _inputs_digest_for_tornado(st.session_state["inputs"])
-                cache_key = "tornado_cache"
-
-                if (cache_key in st.session_state) and (st.session_state[cache_key].get("digest") == digest):
-                    df_tornado = st.session_state[cache_key]["df"]
-                    base_savings_cached = st.session_state[cache_key]["base_savings"]
-                else:
-                    rows = []
-                    for label, key, frac in params:
-                        base_val = _clamp_value(key, base.get(key, 0.0))
-
-                        low = _clamp_value(key, base_val * (1.0 - frac))
-                        high = _clamp_value(key, base_val * (1.0 + frac))
-
-                        # Wenn base_val ≈ 0: nutze Floor als "base" und skaliere davon
-                        if float(base.get(key, 0.0)) == 0.0 and key in ABS_FLOOR:
-                            base_val = float(ABS_FLOOR[key])
-                            low = _clamp_value(key, base_val * (1.0 - frac))
-                            high = _clamp_value(key, base_val * (1.0 + frac))
-
-                        try:
-                            s_low = _run_savings({key: low})
-                            s_high = _run_savings({key: high})
-                        except Exception as e:
-                            s_low = np.nan
-                            s_high = np.nan
-
-                        d_low = s_low - base_savings if np.isfinite(s_low) else np.nan
-                        d_high = s_high - base_savings if np.isfinite(s_high) else np.nan
-
-                        # Range = Spannweite, robust gegen Reihenfolge
-                        if np.isfinite(d_low) and np.isfinite(d_high):
-                            rng = float(abs(d_high - d_low))
-                            lo = float(min(d_low, d_high))
-                            hi = float(max(d_low, d_high))
-                        else:
-                            rng, lo, hi = np.nan, np.nan, np.nan
-
-                        rows.append({
-                            "Parameter": label,
-                            "Key": key,
-                            "Base": base_val,
-                            "Low": low,
-                            "High": high,
-                            "Savings_base": base_savings,
-                            "Savings_low": s_low,
-                            "Savings_high": s_high,
-                            "Delta_low": d_low,
-                            "Delta_high": d_high,
-                            "Lo": lo,
-                            "Hi": hi,
-                            "Range": rng,
-                        })
-
-                    df_tornado = pd.DataFrame(rows)
-                    st.session_state[cache_key] = {"digest": digest, "df": df_tornado, "base_savings": base_savings}
-                    base_savings_cached = base_savings
-
-                # ---------------------------------------------------------
-                # 5) Output: KPIs + Chart + Tabelle + Takeaways
-                # ---------------------------------------------------------
-                c1, c2, c3 = st.columns(3)
-                with c1:
-                    st.metric("Basis-Ersparnis (inkl. Maut)" if st.session_state["lang"] == "DE" else "Base savings (incl. toll)", fmt_eur(base_savings_cached))
-                with c2:
-                    st.metric("Preis-Modus" if st.session_state["lang"] == "DE" else "Price mode",
-                            "Spot (Upload)" if used_spot else ("Dynamic (TOU)" if float(base.get("dynamic_price_share", 0.0)) >= 0.5 else "Fixed"))
-                with c3:
-                    st.metric("Parameter getestet" if st.session_state["lang"] == "DE" else "Params tested", f"{len(df_tornado)}")
-
-                # Sortiert nach Einfluss
-                dfp = df_tornado.copy()
-                dfp = dfp.replace([np.inf, -np.inf], np.nan)
-                dfp = dfp.loc[dfp["Range"].notna()].sort_values("Range", ascending=False)
-
-                if dfp.empty:
-                    st.warning("Tornado nicht verfügbar (keine gültigen Läufe).")
-                    st.dataframe(df_tornado, use_container_width=True, hide_index=True)
-                    st.stop()
-
-                # Tornado Plot (ohne Farben festzunageln)
-                fig, ax = plt.subplots(figsize=(9, 5))
-                y = np.arange(len(dfp))
-                widths = (dfp["Hi"] - dfp["Lo"]).to_numpy()
-                lefts = dfp["Lo"].to_numpy()
-
-                ax.barh(y, widths, left=lefts)
-                ax.axvline(0.0, linestyle="--", alpha=0.4)
-                ax.set_yticks(y)
-                ax.set_yticklabels(dfp["Parameter"].tolist())
-                ax.set_xlabel("Δ Savings vs Base (€/year)" if st.session_state["lang"] == "EN" else "Δ Ersparnis vs Basis (€/Jahr)")
-                ax.grid(True, axis="x", alpha=0.2)
-                fig.tight_layout()
-                st.pyplot(fig, use_container_width=True)
-
-                # Kurzerklärung + Top-Takeaways
-                st.markdown("#### " + t("interpretation"))
-                st.markdown(
-                    tornado_takeaways(dfp, top_n=min(3, len(dfp)))
-                )
-
-                # Tabelle (kompakt)
-                show_cols = ["Parameter", "Base", "Low", "High", "Savings_low", "Savings_high", "Delta_low", "Delta_high", "Range"]
-                st.dataframe(dfp[show_cols], use_container_width=True, hide_index=True)
-
-                with st.expander("Debug: run_model base inputs", expanded=False):
-                    st.json(base)
-
+                render_tornado_tab()
 
 
             with tabs[5]:
-                df_calc = build_calculation_df(res)
-                dfh = build_hourly_df(res)
+                st.subheader("Export" if st.session_state.get("lang", "EN") == "EN" else "Export")
 
-                st.download_button(
-                    "Download results.json",
-                    data=json.dumps(res, ensure_ascii=False, indent=2),
-                    file_name="fleetmate_results.json",
-                    mime="application/json",
-                    use_container_width=True
-                )
-                st.download_button(
-                    "Download calculations.csv",
-                    data=df_calc.to_csv(index=False).encode("utf-8"),
-                    file_name="fleetmate_calculations.csv",
-                    mime="text/csv",
-                    use_container_width=True
-                )
+                # 1) Immer sofort rendern: JSON Download (minimal abhängig)
+                try:
+                    res_json_bytes = json.dumps(res, ensure_ascii=False, indent=2).encode("utf-8")
+                except Exception as e:
+                    st.error("Could not serialize results to JSON.")
+                    st.exception(e)
+                    res_json_bytes = None
 
-                charts = [
-                    ("Price & grid CO₂", fig_to_png_bytes(fig_price_co2(dfh, "Price (€/kWh)"))),
-                    ("Site load profile", fig_to_png_bytes(fig_load(dfh, res["inputs"]["site_capacity_limit_kva"], res["load"]["new_theoretical_peak_kw"]))),
-                    ("Cost waterfall", fig_to_png_bytes(fig_waterfall(res))),
-                    ("Pareto (shift window)", fig_to_png_bytes(fig_pareto_shifted_windows(res))),
-                ]
+                if res_json_bytes is not None:
+                    st.download_button(
+                        "Download results.json",
+                        data=res_json_bytes,
+                        file_name="fleetmate_results.json",
+                        mime="application/json",
+                        use_container_width=True,
+                        key="dl_results_json",
+                    )
 
-                kpis = {
-                    f"{t('kpi_savings')} ({t('per_year')})": fmt_eur(res["diesel_vs_ev"]["total_savings_incl_toll_eur"]),
-                    f"{t('kpi_co2')} ({t('per_year')})": fmt_kg(res["diesel_vs_ev"]["co2_savings_kg"]),
-                    t("kpi_peak"): f"{fmt_num(res['load']['new_theoretical_peak_kw'])} kW",
-                    ("EV cost / year" if st.session_state["lang"] == "EN" else "EV-Kosten / Jahr"): fmt_eur(res["energy_cost"]["annual_cost_eur"]),
-                }
+                # 2) Calculations CSV (kann crashen) -> absichern
+                df_calc = None
+                try:
+                    df_calc = build_calculation_df(res)
+                    csv_bytes = df_calc.to_csv(index=False).encode("utf-8")
+                    st.download_button(
+                        "Download calculations.csv",
+                        data=csv_bytes,
+                        file_name="fleetmate_calculations.csv",
+                        mime="text/csv",
+                        use_container_width=True,
+                        key="dl_calc_csv",
+                    )
+                except Exception as e:
+                    st.error("Could not build calculations.csv (build_calculation_df crashed).")
+                    st.exception(e)
 
-                title = "FleetMate — Report"
-                pdf_bytes = build_report_pdf_bytes(
-                    title=title,
-                    kpis=kpis,
-                    narrative_md=st.session_state.get("report_md") or "",
-                    issues=detect_issues(res),
-                    solutions=generate_solution_set(res, detect_issues(res)),
-                    lang=st.session_state.get("lang", "EN"),
-                    charts=charts,
-                )
+                st.divider()
 
-                st.download_button(
-                    "⬇️ Download PDF report (with charts)" if st.session_state["lang"] == "EN" else "⬇️ PDF-Report (mit Charts) downloaden",
-                    data=pdf_bytes,
-                    file_name="fleetmate_report_with_charts.pdf",
-                    mime="application/pdf",
-                    use_container_width=True
-                )
+                # 3) PDF/Charts: nicht automatisch bei jedem Rerun bauen, sondern on-demand
+                lang = st.session_state.get("lang", "EN")
+                btn_label = "Generate PDF report (with charts)" if lang == "EN" else "PDF-Report (mit Charts) erzeugen"
+                if st.button(btn_label, use_container_width=True, key="btn_gen_pdf"):
+                    with st.spinner("Building PDF..." if lang == "EN" else "Erzeuge PDF..."):
+                        try:
+                            # Hourly DF (für Charts) -> kann crashen
+                            dfh = build_hourly_df(res)
+
+                            # defensive gets (damit KeyErrors nicht alles killen)
+                            site_limit = res.get("inputs", {}).get("site_capacity_limit_kva", None)
+                            new_peak = res.get("load", {}).get("new_theoretical_peak_kw", None)
+
+                            charts = [
+                                ("Price & grid CO₂", fig_to_png_bytes(fig_price_co2(dfh, "Price (€/kWh)"))),
+                                ("Site load profile", fig_to_png_bytes(fig_load(dfh, site_limit, new_peak))),
+                                ("Cost waterfall", fig_to_png_bytes(fig_waterfall(res))),
+                                ("Pareto (shift window)", fig_to_png_bytes(fig_pareto_shifted_windows(res))),
+                            ]
+
+                            issues = detect_issues(res)
+                            solutions = generate_solution_set(res, issues)
+
+                            kpis = {
+                                f"{t('kpi_savings')} ({t('per_year')})": fmt_eur(res["diesel_vs_ev"]["total_savings_incl_toll_eur"]),
+                                f"{t('kpi_co2')} ({t('per_year')})": fmt_kg(res["diesel_vs_ev"]["co2_savings_kg"]),
+                                t("kpi_peak"): f"{fmt_num(res['load']['new_theoretical_peak_kw'])} kW",
+                                ("EV cost / year" if lang == "EN" else "EV-Kosten / Jahr"): fmt_eur(res["energy_cost"]["annual_cost_eur"]),
+                            }
+
+                            title = "FleetMate — Report"
+                            pdf_bytes = build_report_pdf_bytes(
+                                title=title,
+                                kpis=kpis,
+                                narrative_md=st.session_state.get("report_md") or "",
+                                issues=issues,
+                                solutions=solutions,
+                                lang=lang,
+                                charts=charts,
+                            )
+
+                            # im State speichern, damit Download unabhängig von Reruns stabil bleibt
+                            st.session_state["export_pdf_bytes"] = pdf_bytes
+
+                            st.success("PDF ready." if lang == "EN" else "PDF fertig.")
+                        except Exception as e:
+                            st.error("PDF build failed.")
+                            st.exception(e)
+                            st.session_state.pop("export_pdf_bytes", None)
+
+                # 4) Download-Button nur anzeigen, wenn PDF wirklich vorhanden
+                pdf_bytes = st.session_state.get("export_pdf_bytes", None)
+                if pdf_bytes:
+                    st.download_button(
+                        "⬇️ Download PDF report (with charts)" if lang == "EN" else "⬇️ PDF-Report (mit Charts) downloaden",
+                        data=pdf_bytes,
+                        file_name="fleetmate_report_with_charts.pdf",
+                        mime="application/pdf",
+                        use_container_width=True,
+                        key="dl_pdf_report",
+                    )

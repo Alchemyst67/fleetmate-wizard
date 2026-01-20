@@ -147,7 +147,7 @@ def _extract_load_profile_df(res: Dict[str, Any]) -> Optional[pd.DataFrame]:
     dt_col = None
     for col in df.columns:
         lc = str(col).lower()
-        if lc in ("ts", "timestamp", "datetime", "date_time", "time", "datum", "zeit"):
+        if any(k in lc for k in ("timestamp","datetime","date_time","date/time","date","time","datum","zeit","ts")):
             dt_col = col
             break
     if dt_col is None:
@@ -165,12 +165,16 @@ def _extract_load_profile_df(res: Dict[str, Any]) -> Optional[pd.DataFrame]:
         return None
 
     # Find power column
+    # Find power column (robust)
     p_col = None
     for col in df.columns:
-        lc = str(col).lower().replace(" ", "")
-        if lc in ("kw", "power_kw", "load_kw", "p_kw", "leistung_kw"):
+        lc = str(col).lower()
+        norm = "".join(ch for ch in lc if ch.isalnum())  # removes spaces, (), [], etc.
+        # accept lots of real-world variants like "Power (kW)", "Leistung[kW]", "kW_total"
+        if ("kw" in norm and ("power" in norm or "leistung" in norm or "load" in norm)) or norm in ("kw", "powerkw", "loadkw", "pkw", "leistungkw"):
             p_col = col
             break
+
     if p_col is None:
         # Fallback: first numeric column
         num_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
@@ -265,8 +269,26 @@ def compute_charging_feasibility(res: Dict[str, Any]) -> ChargingFeasibility:
         headroom_kw = max(0.0, kw_limit - baseline_avg_kw_in_window)
 
     # EV energy/day
-    ev_trucks = _int(_get(inputs, "ev_truck_count", _get(load, "ev_truck_count", 0)), 0)
-    km_per_truck_day = _num(_get(inputs, "km_per_truck_day", _get(load, "km_per_truck_day", 0.0)), 0.0)
+    # --- EV trucks (support aliases from UI) ---
+    ev_trucks = _int(
+        _get(inputs, "ev_truck_count",
+            _get(inputs, "ev_trucks",
+                _get(inputs, "num_ev_trucks",
+                    _get(load, "ev_truck_count",
+                            _get(load, "ev_trucks", 0))))),
+        0
+    )
+
+    # --- km per truck per day (support aliases) ---
+    km_per_truck_day = _num(
+        _get(inputs, "km_per_truck_day",
+            _get(inputs, "km_per_truck_per_day",
+                _get(inputs, "km_per_truck_per_day_km",
+                    _get(load, "km_per_truck_day",
+                            _get(load, "km_per_truck_per_day", 0.0))))),
+        0.0
+    )
+
 
     # consumption: support multiple keys
     ev_kwh_per_km = _num(
@@ -479,6 +501,14 @@ def _hourly_baseline_by_hour(res: Dict[str, Any]) -> np.ndarray:
     """
     lp = _extract_load_profile_df(res)
     if lp is None:
+        # Fallback: if we at least know a baseline average in the window, use it as flat baseline
+        cap = _extract_capacity(res)
+        base_avg = _num(_get(cap, "baseline_avg_kw_in_window", 0.0), 0.0)
+        if base_avg > 0:
+            return np.full(24, base_avg, dtype=float)
+        return np.zeros(24, dtype=float)
+
+    if lp is None:
         return np.zeros(24, dtype=float)
 
     hourly = lp["kw"].resample("1H").mean().dropna()
@@ -640,11 +670,25 @@ def plot_energy_year(res: Dict[str, Any], *, title: str = "Annual energy consump
 # Textual recommendations (more marketing) + outlook + ZYNE modules
 # -------------------------
 
-def build_recommendation_markdown(res: Dict[str, Any]) -> str:
+def build_recommendation_markdown(res: Dict[str, Any], lang: Optional[str] = None) -> str:
     """
     Produces a single markdown block that reads "clean" in Streamlit.
-    More persuasive tone; numbers are grounded where possible.
+    Language: DE/EN (controlled via `lang`).
     """
+    # --- language resolution ---
+    lang = (lang or (res.get("inputs") or {}).get("lang") or "DE").upper()
+    if lang not in ("DE", "EN"):
+        lang = "DE"
+
+    def L(de: str, en: str) -> str:
+        return en if lang == "EN" else de
+
+    def _pick(v: Any) -> str:
+        """Allow solution fields to be str or {DE/EN} dicts."""
+        if isinstance(v, dict):
+            return str(v.get(lang) or v.get("EN") or v.get("DE") or "").strip()
+        return str(v or "").strip()
+
     cf = compute_charging_feasibility(res)
     issues = detect_issues(res)
     solutions = generate_solution_set(res, issues)
@@ -658,76 +702,127 @@ def build_recommendation_markdown(res: Dict[str, Any]) -> str:
     lines: List[str] = []
 
     # Headline
-    lines.append("### Empfehlungen (kompakt, entscheidungsorientiert)")
+    lines.append(L("### Empfehlungen (kompakt, entscheidungsorientiert)",
+                   "### Recommendations (concise, decision-oriented)"))
 
     # Core facts
-    lines.append("**Kernzahlen (Laden & Peak):**")
-    lines.append(f"- Ladefenster: **{cf.window_hours} h**")
+    lines.append(L("**Kernzahlen (Laden & Peak):**",
+                   "**Key numbers (charging & peak):**"))
+    lines.append(f"- {L('Ladefenster', 'Charging window')}: **{cf.window_hours} h**")
+
     if cf.kw_limit > 0:
-        lines.append(f"- kW-Limit (kVA·cosφ): **{_fmt_kw(cf.kw_limit, 1)}**")
+        lines.append(f"- {L('kW-Limit (kVA·cosφ)', 'kW limit (kVA·cosφ)')}: **{_fmt_kw(cf.kw_limit, 1)}**")
     if cf.baseline_avg_kw_in_window > 0:
-        lines.append(f"- Baseline im Ladefenster (Ø): **{_fmt_kw(cf.baseline_avg_kw_in_window, 1)}**")
-    lines.append(f"- Headroom im Ladefenster: **{_fmt_kw(cf.headroom_kw, 1)}**")
+        lines.append(f"- {L('Baseline im Ladefenster (Ø)', 'Baseline in window (avg)')}: **{_fmt_kw(cf.baseline_avg_kw_in_window, 1)}**")
+
+    lines.append(f"- {L('Headroom im Ladefenster', 'Headroom in window')}: **{_fmt_kw(cf.headroom_kw, 1)}**")
+
     if cf.ev_trucks > 0:
-        lines.append(f"- EV-Flotte: **{cf.ev_trucks} Trucks**, tägliche Ladeenergie: **{_fmt_kwh(cf.ev_kwh_day_total, 0)}**")
-        lines.append(f"- Ø Ladeleistung nötig (wenn nur im Fenster): **{_fmt_kw(cf.ev_kw_avg_needed, 1)}**")
+        lines.append(
+            f"- {L('EV-Flotte', 'EV fleet')}: **{cf.ev_trucks} {L('Trucks', 'trucks')}**, "
+            f"{L('tägliche Ladeenergie', 'daily charging energy')}: **{_fmt_kwh(cf.ev_kwh_day_total, 0)}**"
+        )
+        lines.append(
+            f"- {L('Ø Ladeleistung nötig (wenn nur im Fenster)', 'Avg charging power needed (if only within window)')}: "
+            f"**{_fmt_kw(cf.ev_kw_avg_needed, 1)}**"
+        )
 
     if total_price > 0 and cf.ev_kwh_day_total > 0:
         lines.append("")
-        lines.append("**Ladekosten (EV):**")
-        lines.append(f"- ca. **{_fmt_eur(ev_charge_cost_day, 0)} / Tag**")
-        lines.append(f"- ca. **{_fmt_eur(ev_charge_cost_year, 0)} / Jahr** (bei 365 Tagen)")
+        lines.append(L("**Ladekosten (EV):**", "**Charging cost (EV):**"))
+        lines.append(f"- {L('ca.', 'approx.')} **{_fmt_eur(ev_charge_cost_day, 0)} / {L('Tag', 'day')}**")
+        lines.append(f"- {L('ca.', 'approx.')} **{_fmt_eur(ev_charge_cost_year, 0)} / {L('Jahr', 'year')}** "
+                     f"({L('bei 365 Tagen', '365 days')})")
 
     # Decision: feasible?
     lines.append("")
     if cf.ev_trucks <= 0:
-        lines.append("**Status:** Keine EV-Trucks konfiguriert – Lade-/Peak-Entscheidung entfällt.")
+        lines.append(L("**Status:** Keine EV-Trucks konfiguriert – Lade-/Peak-Entscheidung entfällt.",
+                       "**Status:** No EV trucks configured — charging/peak decision not applicable."))
     else:
         if cf.feasible_under_cap:
-            lines.append("**Status:** **Laden passt unter den Peak/Cap** – gute Ausgangslage für skalierbaren Betrieb.")
+            lines.append(L("**Status:** **Laden passt unter den Peak/Cap** – gute Ausgangslage für skalierbaren Betrieb.",
+                           "**Status:** **Charging fits under peak/cap** — good baseline for scalable operations."))
             if cf.time_needed_at_headroom_h is not None:
-                lines.append(f"- Benötigte Ladezeit (bei Headroom): **{cf.time_needed_at_headroom_h:.1f} h** "
-                             f"vs. Fenster **{cf.window_hours} h**")
+                lines.append(
+                    L("- Benötigte Ladezeit (bei Headroom): ",
+                      "- Charging time needed (at headroom): ")
+                    + f"**{cf.time_needed_at_headroom_h:.1f} h** "
+                      f"{L('vs. Fenster', 'vs window')} **{cf.window_hours} h**"
+                )
         else:
-            lines.append("**Status:** **Laden passt NICHT unter den Peak/Cap** – es braucht eine bewusste Strategie.")
-            lines.append(f"- Unter Cap gehen sich ca. **{cf.max_trucks_under_cap} / {cf.ev_trucks} Trucks** aus (gleichmäßiges Laden angenommen).")
-            lines.append(f"- Alternativ: Peak-Erhöhung um ca. **{_fmt_kw(cf.extra_peak_kw_if_full, 1)}**.")
+            lines.append(L("**Status:** **Laden passt NICHT unter den Peak/Cap** – es braucht eine bewusste Strategie.",
+                           "**Status:** **Charging does NOT fit under peak/cap** — requires an explicit strategy."))
+            lines.append(
+                L("- Unter Cap gehen sich ca. ",
+                  "- Under cap, approx. ")
+                + f"**{cf.max_trucks_under_cap} / {cf.ev_trucks} {L('Trucks', 'trucks')}** "
+                  + L("aus (gleichmäßiges Laden angenommen).",
+                      "(assuming uniform charging).")
+            )
+            lines.append(
+                L("- Alternativ: Peak-Erhöhung um ca. ",
+                  "- Alternative: increase peak by approx. ")
+                + f"**{_fmt_kw(cf.extra_peak_kw_if_full, 1)}**."
+            )
             if cf.extra_capacity_cost_eur_year > 0:
-                lines.append(f"- Grobe Mehrkosten Leistungsentgelt: **{_fmt_eur(cf.extra_capacity_cost_eur_year, 0)} / Jahr**")
-
-            # Tours + charging time best-effort
+                lines.append(
+                    L("- Grobe Mehrkosten Leistungsentgelt: ",
+                      "- Rough additional demand-charge cost: ")
+                    + f"**{_fmt_eur(cf.extra_capacity_cost_eur_year, 0)} / {L('Jahr', 'year')}**"
+                )
             if cf.tour_completion_ratio < 1.0:
-                lines.append(f"- Best-effort Tour-Abdeckung (energie-basiert): **{_fmt_pct(cf.tour_completion_ratio, 0)}** "
-                             f"(wenn strikt unter Cap geladen wird).")
+                lines.append(
+                    L("- Best-effort Tour-Abdeckung (energie-basiert): ",
+                      "- Best-effort tour coverage (energy-based): ")
+                    + f"**{_fmt_pct(cf.tour_completion_ratio, 0)}** "
+                    + L("(wenn strikt unter Cap geladen wird).",
+                        "(if strictly charging under cap).")
+                )
 
     # Top solutions (ordered)
     lines.append("")
-    lines.append("**Empfohlene Optionen (pragmatisch):**")
+    lines.append(L("**Empfohlene Optionen (pragmatisch):**",
+                   "**Recommended options (pragmatic):**"))
     for s in solutions[:4]:
-        flag = " (empfohlen)" if s.get("recommended") else ""
-        lines.append(f"- **{s.get('title','Option')}**{flag}: {s.get('what','')}")
+        flag = L(" (empfohlen)", " (recommended)") if s.get("recommended") else ""
+        title = _pick(s.get("title", "Option"))
+        what = _pick(s.get("what", ""))
+        lines.append(f"- **{title}**{flag}: {what}")
+
         how = s.get("how", [])
         if isinstance(how, list) and how:
             for h in how[:3]:
-                lines.append(f"  - {h}")
+                lines.append(f"  - {_pick(h)}")
 
     # Outlook
     lines.append("")
-    lines.append("### Outlook (was noch möglich ist)")
-    lines.append("- **Automatisches Peak-Shaving**: Ladeprofile dynamisch an Preise + Netzzustand koppeln (Kosten runter, Planbarkeit rauf).")
-    lines.append("- **Skalierungssimulation**: Was passiert bei +5 / +10 Trucks? Cap, Kosten, notwendige Infrastruktur auf Knopfdruck.")
-    lines.append("- **CO₂ & ESG-Reporting**: auditierbare Einsparungen (Diesel→EV), Scope-Reporting, Förderlogik.")
-    lines.append("- **Dispatch & Tour-Optimierung**: Tourenplanung gekoppelt an Lade- und Energieverfügbarkeit (weniger Überraschungen im Betrieb).")
+    lines.append(L("### Outlook (was noch möglich ist)",
+                   "### Outlook (what else is possible)"))
+    lines.append(L("- **Automatisches Peak-Shaving**: Ladeprofile dynamisch an Preise + Netzzustand koppeln (Kosten runter, Planbarkeit rauf).",
+                   "- **Automated peak shaving**: link charging profiles dynamically to prices + grid state (lower cost, higher predictability)."))
+    lines.append(L("- **Skalierungssimulation**: Was passiert bei +5 / +10 Trucks? Cap, Kosten, notwendige Infrastruktur auf Knopfdruck.",
+                   "- **Scale simulation**: what happens at +5 / +10 trucks? Cap, cost, required infrastructure at the push of a button."))
+    lines.append(L("- **CO₂ & ESG-Reporting**: auditierbare Einsparungen (Diesel→EV), Scope-Reporting, Förderlogik.",
+                   "- **CO₂ & ESG reporting**: auditable savings (diesel→EV), scope reporting, subsidy logic."))
+    lines.append(L("- **Dispatch & Tour-Optimierung**: Tourenplanung gekoppelt an Lade- und Energieverfügbarkeit (weniger Überraschungen im Betrieb).",
+                   "- **Dispatch & tour optimisation**: route planning coupled with charging + energy availability (fewer operational surprises)."))
 
     # ZYNE modules (non-assertive)
     lines.append("")
-    lines.append("### ZYNE – welche Bausteine du typischerweise jetzt brauchst")
-    lines.append("- **Energy & Tariff Intelligence**: belastbare Preis-/Netzkostenlogik inkl. Leistungsentgelt und Szenarien.")
-    lines.append("- **Charging Control / EMS**: Priorisierung, Ladefenster-Regeln, harte Peak-Kappung, Alerts bei Cap-Risiko.")
-    lines.append("- **Monitoring & Reporting**: Dashboards (Peak, kWh, Kosten, Abweichungen), Export für Stakeholder/Controlling.")
-    lines.append("- **Data Connectors**: Telematik/Depot/Charger/Load-Profile sauber anbinden (damit das Modell “lebt”).")
+    lines.append(L("### ZYNE – welche Bausteine du typischerweise jetzt brauchst",
+                   "### ZYNE — typical building blocks you’ll need next"))
+    lines.append(L("- **Energy & Tariff Intelligence**: belastbare Preis-/Netzkostenlogik inkl. Leistungsentgelt und Szenarien.",
+                   "- **Energy & Tariff Intelligence**: robust price/grid-cost logic incl. demand charges and scenarios."))
+    lines.append(L("- **Charging Control / EMS**: Priorisierung, Ladefenster-Regeln, harte Peak-Kappung, Alerts bei Cap-Risiko.",
+                   "- **Charging Control / EMS**: prioritisation, charging-window rules, hard peak capping, alerts on cap risk."))
+    lines.append(L("- **Monitoring & Reporting**: Dashboards (Peak, kWh, Kosten, Abweichungen), Export für Stakeholder/Controlling.",
+                   "- **Monitoring & reporting**: dashboards (peak, kWh, cost, deviations), exports for stakeholders/controlling."))
+    lines.append(L("- **Data Connectors**: Telematik/Depot/Charger/Load-Profile sauber anbinden (damit das Modell “lebt”).",
+                   "- **Data connectors**: integrate telematics/depot/chargers/load profiles cleanly (so the model “lives”)."))
 
     return "\n".join(lines)
+
 
 
 # -------------------------
@@ -819,7 +914,7 @@ def render_energy_year_chart_streamlit(res: Dict[str, Any], st, *, title: str = 
     st.pyplot(fig, clear_figure=True)
 
 def render_recommendations_streamlit(res: Dict[str, Any], st) -> None:
-    st.markdown(build_recommendation_markdown(res))
+    st.markdown(build_recommendation_markdown(res, "EN"))
 
 
 
